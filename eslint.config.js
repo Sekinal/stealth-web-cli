@@ -33,6 +33,8 @@ module.exports = tseslint.config(
         clearInterval: 'readonly',
         URL: 'readonly',
         fetch: 'readonly',
+        AbortController: 'readonly',
+        AbortSignal: 'readonly',
       },
     },
     linterOptions: {

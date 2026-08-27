@@ -815,6 +815,72 @@ test('fetch supports basic auth via --user/--password', async ({}) => {
   }
 });
 
+test('fetch defaults to the wreq engine without an open session', async ({}) => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ seen: req.headers['user-agent'] ?? '' }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    // No `open` first: wreq must not require a session.
+    const result = await runCli('-s=engine-default', 'fetch', `http://127.0.0.1:${address.port}/`, '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(true);
+    expect(payload.result.engine).toBe('wreq');
+    expect(payload.result.status).toBe(200);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('fetch --engine=httpcloak issues a request without a session', async ({}) => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('httpcloak reached me');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    const result = await runCli('-s=engine-httpcloak', 'fetch', `http://127.0.0.1:${address.port}/`, '--engine=httpcloak', '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(true);
+    expect(payload.result.engine).toBe('httpcloak');
+    expect(payload.result.body).toBe('httpcloak reached me');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('fetch rejects an unsupported engine before contacting any session', async ({}) => {
+  const result = await runCli('fetch', 'https://example.com', '--engine=nonsense', '--json');
+  expect(result.exitCode).not.toBe(0);
+  expect(result.output).toContain('Unsupported --engine');
+});
+
+test('fetch --engine=browser requires a session and tags the result', async ({}) => {
+  await runCli('-s=engine-browser', 'open', 'data:text/html,<title>B</title>');
+  const result = await runCli('-s=engine-browser', 'fetch', 'data:text/html,plain-body', '--engine=browser', '--json');
+  const payload = JSON.parse(result.output);
+  expect(payload.ok).toBe(true);
+  expect(payload.result.engine).toBe('browser');
+  expect(payload.result.body).toContain('plain-body');
+  await runCli('-s=engine-browser', 'close');
+});
 test('wait-for waits for a selector or text to appear', async ({}) => {
   await runCli('-s=wait-for-test', 'open', 'data:text/html,<h1>Welcome</h1>');
   const found = await runCli('-s=wait-for-test', 'wait-for', 'text=Welcome', '--timeout=5', '--json');

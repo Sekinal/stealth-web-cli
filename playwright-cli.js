@@ -53,6 +53,11 @@ async function main() {
   }
   if (command !== 'install')
     checkInstalledSkills();
+  // Non-browser fetch engines run without a session; the upstream program
+  // would exit on its session gate before our run wrapper could dispatch.
+  const { runEngineFetchFromArgv } = require('./cliEnhancements');
+  if (await runEngineFetchFromArgv(argv, process.env))
+    return;
   const providerConfig = await configureBrowserProviderFallbacks({ command, sessionModule });
   configureCliEnhancements({ argv, command, providerConfig, sessionModule, outputModule, help });
   await notifyAboutUpdate(command).catch(() => {});

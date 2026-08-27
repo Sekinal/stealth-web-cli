@@ -87,17 +87,18 @@ function extendHelp(help) {
   }
   if (!help.commands.fetch) {
     help.commands.fetch = {
-      flags: { method: 'string', data: 'string', header: 'string', timeout: 'string', user: 'string', password: 'string', retry: 'string' },
+      flags: { method: 'string', data: 'string', header: 'string', timeout: 'string', user: 'string', password: 'string', retry: 'string', engine: 'string' },
       args: ['url'],
       raw: true,
       help: [
-        'playwright-cli fetch <url>               make an HTTP request via the browser network stack',
+        'playwright-cli fetch <url>               make an HTTP request (engine: wreq by default, or via the browser)',
         '  --method=GET|POST|PUT|PATCH|DELETE|HEAD  HTTP method (default GET)',
         '  --data=<body>                            request body (POST/PUT/PATCH)',
         '  --header="Key: Value"                    request header (comma-separated)',
         '  --user=<name> --password=<secret>        basic authentication',
         '  --timeout=<seconds>                      request timeout (default: no timeout)',
         '  --retry=<N>                              retry up to N times on 5xx/network errors',
+        '  --engine=wreq|httpcloak|browser          transport engine (default wreq; browser requires an open session)',
       ].join('\n'),
     };
   }
@@ -189,6 +190,11 @@ function patchSession(Session, options) {
   Session.prototype.run = async function(clientInfo, args, runOptions) {
     const evalOutputPath = resolveEvalOutputPath(args);
     const preparedArgs = prepareCommandArgs(args);
+    // Non-browser fetch engines (wreq/httpcloak) run entirely in Node and
+    // never require an open browser session.
+    if (preparedArgs._?.[0] === 'engine-fetch' && preparedArgs._engineRequest && preparedArgs._engineRequest.engine !== 'browser') {
+      return await emitEngineFetchResult(preparedArgs._engineRequest, this, options, runOptions);
+    }
     try {
       let result = await originalRun.call(this, clientInfo, preparedArgs, runOptions);
       if (result.isError)
@@ -476,6 +482,10 @@ function prepareCommandArgs(args) {
     const method = (prepared.method ?? 'GET').toUpperCase();
     if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(method))
       throw new Error(`Unsupported fetch method '${prepared.method}'. Expected one of: GET, POST, PUT, PATCH, DELETE, HEAD.`);
+    const engineRaw = typeof prepared.engine === 'string' ? prepared.engine.toLowerCase() : '';
+    const engine = engineRaw === undefined || engineRaw === '' ? 'wreq' : engineRaw;
+    if (!['wreq', 'httpcloak', 'browser'].includes(engine))
+      throw new Error(`Unsupported --engine '${prepared.engine}'. Expected one of: wreq, httpcloak, browser.`);
     const data = prepared.data;
     const headerArg = prepared.header;
     const timeoutMs = prepared.timeout !== undefined ? parseTimeoutMs(prepared.timeout) : undefined;
@@ -494,6 +504,7 @@ function prepareCommandArgs(args) {
     delete prepared.retry;
     delete prepared.user;
     delete prepared.password;
+    delete prepared.engine;
     const mergedHeaders = {
       ...(headerArg !== undefined ? parseHeaderArg(headerArg) : {}),
       ...(authHeader ? parseHeaderArg(authHeader) : {}),
@@ -505,6 +516,24 @@ function prepareCommandArgs(args) {
       timeoutMs !== undefined ? `timeout: ${timeoutMs}` : '',
     ].filter(Boolean).join(', ');
     const maxAttempts = retryCount + 1;
+
+    // Non-browser engines run in Node before the daemon is ever contacted;
+    // stash the request spec for the run-wrapper to dispatch.
+    if (engine !== 'browser') {
+      prepared._ = ['engine-fetch'];
+      prepared._engineRequest = {
+        engine,
+        url,
+        method,
+        data,
+        headers: mergedHeaders,
+        timeoutMs,
+        retryCount,
+        maxAttempts,
+      };
+      return prepared;
+    }
+
     prepared._ = ['run-code', `async (page) => {
   const startedAt = Date.now();
   const url = ${JSON.stringify(url)};
@@ -514,7 +543,7 @@ function prepareCommandArgs(args) {
       const r = await fetch(u);
       return { status: r.status, statusText: r.statusText, headers: Object.fromEntries(r.headers.entries()), body: await r.text() };
     }, url);
-    return { ...res, url, redirected: false, failed: res.status >= 400 };
+    return { ...res, url, redirected: false, failed: res.status >= 400, engine: 'browser' };
   }
   let response = null;
   let lastError = null;
@@ -553,7 +582,7 @@ function prepareCommandArgs(args) {
     body = await response.text();
   }
   let json = null;
-  if (!binary) { try { json = JSON.parse(body); } catch (_) {} }
+  if (!binary) { try { json = JSON.parse(body); } catch {} }
   return {
     status,
     statusText: response.statusText(),
@@ -566,6 +595,7 @@ function prepareCommandArgs(args) {
     durationMs: Date.now() - startedAt,
     ...(binary ? { binary: true } : {}),
     ...(json !== null ? { json } : {}),
+    engine: 'browser',
     failed: status >= 400,
   };
 }`];
@@ -681,7 +711,7 @@ function prepareCommandArgs(args) {
     try {
       const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
       await frame.locator('input[type="checkbox"], [role="checkbox"], .chakra-checkbox, label').first().click({ timeout: 3000 });
-    } catch (_) {}
+    } catch {}
   }
   if (type === 'recaptcha') {
     try {
@@ -689,7 +719,7 @@ function prepareCommandArgs(args) {
         const box = document.querySelector('.recaptcha-checkbox, iframe[title*="reCAPTCHA"]');
         if (box) box.click();
       });
-    } catch (_) {}
+    } catch {}
   }
   try {
     const holdButton = page.locator('button:has-text("hold"), button:has-text("press"), [role="button"]:has-text("hold"), [role="button"]:has-text("press")').first();
@@ -700,7 +730,7 @@ function prepareCommandArgs(args) {
       await page.waitForTimeout(5000);
       await page.mouse.up();
     }
-  } catch (_) {}
+  } catch {}
   const deadline = Date.now() + ${timeoutMs};
   while (Date.now() < deadline) {
     const token = await page.evaluate((sel) => {
@@ -1067,6 +1097,258 @@ function parseJsonText(value) {
 }
 
 /**
+ * A fetch request routed through a non-browser engine.
+ *
+ * @typedef {Object} EngineRequest
+ * @property {string} engine 'wreq' | 'httpcloak' | 'browser'
+ * @property {string} url
+ * @property {string} method
+ * @property {string | undefined} data
+ * @property {Record<string, string>} headers
+ * @property {number | undefined} timeoutMs
+ * @property {number} retryCount
+ * @property {number} maxAttempts
+ */
+
+/**
+ * Execute a fetch through the wreq engine (node-wreq, Chrome-impersonating
+ * Rust TLS core). Runs entirely in Node — no browser session needed.
+ *
+ * @param {EngineRequest} req
+ * @returns {Promise<{ status: any, statusText: any, url: any, redirected: boolean,
+ *   headers: Record<string, string>, body: any, binary: boolean, json: any,
+ *   attempts: number, retried: boolean, durationMs: number, engine: string, failed: boolean }>}
+ */
+async function fetchWithWreq(req) {
+  const wreq = /** @type {any} */ (require('node-wreq'));
+  const profiles = wreq.getProfiles();
+  const newestChrome = profiles.filter(p => p.startsWith('chrome')).sort((a, b) => parseInt(b.split('_')[1], 10) - parseInt(a.split('_')[1], 10))[0];
+  const startedAt = Date.now();
+  const headers = { ...req.headers };
+  if (req.data !== undefined && !Object.keys(headers).some(h => h.toLowerCase() === 'content-type'))
+    headers['content-type'] = 'application/json';
+  const controller = new AbortController();
+  const timeout = req.timeoutMs ? setTimeout(() => controller.abort(), req.timeoutMs) : null;
+  let response = null;
+  let lastError = null;
+  let attempts = 0;
+  try {
+    for (let i = 0; i < req.maxAttempts; i++) {
+      attempts = i + 1;
+      try {
+        response = await wreq.fetch(req.url, {
+          method: req.method,
+          headers,
+          body: req.data !== undefined ? (typeof req.data === 'string' ? req.data : JSON.stringify(req.data)) : undefined,
+          impersonate: newestChrome,
+          redirect: 'follow',
+          signal: controller?.signal,
+        });
+        lastError = null;
+      } catch (error) {
+        lastError = error;
+      }
+      const statusNow = response ? response.status : null;
+      const shouldRetry = req.retryCount > 0 && i < req.maxAttempts - 1 && (lastError !== null || (statusNow !== null && statusNow >= 500));
+      if (!shouldRetry)
+        break;
+      await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (lastError && !response)
+    throw lastError;
+  const responseHeaders = /** @type {Record<string, string>} */ ({});
+  response.headers.forEach((value, name) => { responseHeaders[name.toLowerCase()] = value; });
+  const contentType = responseHeaders['content-type'] ?? '';
+  const isBinary = /octet-stream|image\/|application\/pdf|application\/zip|application\/gzip|audio\/|video\/|font\//.test(contentType);
+  let body;
+  let binary = false;
+  if (isBinary) {
+    body = Buffer.from(await response.arrayBuffer()).toString('base64');
+    binary = true;
+  } else {
+    body = await response.text();
+  }
+  let json = null;
+  if (!binary) { try { json = JSON.parse(body); } catch {} }
+  /** @type {{ status: any, statusText: any, url: any, redirected: boolean, headers: Record<string, string>, body: any, binary: boolean, json: any, attempts: number, retried: boolean, durationMs: number, engine: string, failed: boolean }} */
+  return {
+    status: response.status,
+    statusText: response.statusText || '',
+    url: response.url || req.url,
+    redirected: response.url ? response.url !== req.url : false,
+    headers: responseHeaders,
+    body,
+    attempts,
+    retried: attempts > 1,
+    durationMs: Date.now() - startedAt,
+    binary,
+    json,
+    engine: 'wreq',
+    failed: response.status >= 400,
+  };
+}
+
+/**
+ * Execute a fetch through httpcloak's Chrome-fingerprint HTTP client.
+ * @param {EngineRequest} req
+ * @returns {Promise<{ status: any, statusText: any, url: any, redirected: boolean,
+ *   headers: Record<string, string>, body: any, binary: boolean, json: any,
+ *   attempts: number, retried: boolean, durationMs: number, engine: string, failed: boolean }>}
+ */
+async function fetchWithHttpcloak(req) {
+  const { Session } = require('httpcloak');
+  const session = new Session({ preset: 'chrome-latest' });
+  const startedAt = Date.now();
+  let response = null;
+  let lastError = null;
+  let attempts = 0;
+  try {
+    for (let i = 0; i < req.maxAttempts; i++) {
+      attempts = i + 1;
+      try {
+        const options = { headers: Object.keys(req.headers).length ? req.headers : undefined };
+        if (req.data !== undefined)
+          options.json = req.data;
+        if (req.timeoutMs)
+          options.timeout = req.timeoutMs;
+        response = await session.request(req.method.toLowerCase(), req.url, options);
+        lastError = null;
+      } catch (error) {
+        lastError = error;
+      }
+      const statusNow = response ? response.statusCode : null;
+      const shouldRetry = req.retryCount > 0 && i < req.maxAttempts - 1 && (lastError !== null || (statusNow !== null && statusNow >= 500));
+      if (!shouldRetry)
+        break;
+      await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+  } finally {
+    session.close();
+  }
+  if (lastError && !response)
+    throw lastError;
+  const headers = /** @type {Record<string, string>} */ ({});
+  for (const [name, value] of Object.entries(response.headers ?? {}))
+    headers[String(name).toLowerCase()] = String(value);
+  const contentType = headers['content-type'] ?? '';
+  const isBinary = /octet-stream|image\/|application\/pdf|application\/zip|application\/gzip|audio\/|video\/|font\//.test(contentType);
+  let body = response.text ?? '';
+  let binary = false;
+  if (isBinary) {
+    body = Buffer.from(body, 'binary').toString('base64');
+    binary = true;
+  }
+  let json = null;
+  if (!binary) { try { json = JSON.parse(body); } catch {} }
+  /** @type {{ status: any, statusText: any, url: any, redirected: boolean, headers: Record<string, string>, body: any, binary: boolean, json: any, attempts: number, retried: boolean, durationMs: number, engine: string, failed: boolean }} */
+  return {
+    status: response.statusCode,
+    statusText: '',
+    url: response.finalUrl || req.url,
+    redirected: (response.finalUrl || req.url) !== req.url,
+    headers,
+    body,
+    attempts,
+    retried: attempts > 1,
+    durationMs: Date.now() - startedAt,
+    binary,
+    json,
+    engine: 'httpcloak',
+    failed: response.statusCode >= 400,
+  };
+}
+
+/**
+ * Dispatch a fetch request to the configured non-browser engine.
+ *
+ * @param {EngineRequest} req
+ * @returns {Promise<Record<string, any>>}
+ */
+async function runEngineFetch(req) {
+  if (req.engine === 'httpcloak') {
+    const available = (() => { try { require.resolve('httpcloak'); return true; } catch { return false; } })();
+    if (!available)
+      throw new Error('httpcloak is not installed; use --engine=wreq (default) or --engine=browser.');
+    return await fetchWithHttpcloak(req);
+  }
+  return await fetchWithWreq(req);
+}
+
+/**
+ * Run a non-browser engine fetch and render its result in the requested
+ * output mode.
+ *
+ * @param {import('./cliEnhancements').EngineRequest} engineRequest
+ * @param {any} session
+ * @param {{ env: NodeJS.ProcessEnv }} options
+ * @param {{ json?: boolean, raw?: boolean } | undefined} runOptions
+ * @returns {Promise<{ isError: boolean, text: string }>}
+ */
+async function emitEngineFetchResult(engineRequest, session, options, runOptions) {
+  let engineResult;
+  try {
+    engineResult = await runEngineFetch(engineRequest);
+  } catch (error) {
+    const payload = failurePayload(error, undefined, [], providerDetailsForSession(session, options.env), fallbackDetailsForSession(session, options.env));
+    process.exitCode = 1;
+    return { isError: true, text: JSON.stringify(payload, null, 2) };
+  }
+  if (!runOptions?.json) {
+    if (engineResult.failed)
+      process.exitCode = 1;
+    return { isError: false, text: runOptions?.raw && !engineResult.binary ? engineResult.body : JSON.stringify(engineResult, null, 2) };
+  }
+  if (engineResult.failed)
+    process.exitCode = 1;
+  return { isError: false, text: JSON.stringify({
+    ...successPayload(null, engineResult, [], providerDetailsForSession(session, options.env), fallbackDetailsForSession(session, options.env), proxyDetails(options.env)),
+    ok: !engineResult.failed,
+    ...(engineResult.failed ? { error: `HTTP ${engineResult.status} ${engineResult.statusText ?? ''}`.trim() } : {}),
+  }, null, 2) };
+}
+
+/**
+ * Run an engine fetch directly from main() and emit the result, bypassing the
+ * upstream program (whose session gate would exit before our run wrapper can
+ * dispatch a sessionless engine request). Returns true when the argv was an
+ * engine fetch and fully handled.
+ *
+ * @param {string[]} argv
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {Promise<boolean>}
+ */
+async function runEngineFetchFromArgv(argv, env) {
+  const command = argv.find(arg => !arg.startsWith('-'));
+  if (command !== 'fetch')
+    return false;
+  const prepared = prepareCommandArgs({ _: argv.filter(arg => !arg.startsWith('-') || arg.startsWith('--')) });
+  if (prepared._?.[0] !== 'engine-fetch' || !prepared._engineRequest)
+    return false;
+  // The upstream parser drops unknown flags, so --engine= never reaches
+  // prepared.engine when passed on the command line. Extract it from argv.
+  const engineFlag = argv.find(arg => arg.startsWith('--engine='));
+  if (engineFlag) {
+    const requested = engineFlag.slice('--engine='.length).toLowerCase();
+    if (!['wreq', 'httpcloak', 'browser'].includes(requested))
+      throw new Error(`Unsupported --engine '${engineFlag.slice(9)}'. Expected one of: wreq, httpcloak, browser.`);
+    if (requested === 'browser')
+      return false; // needs a live session; let the daemon path handle it
+    prepared._engineRequest.engine = requested;
+  }
+
+  const outputMode = { json: argv.includes('--json'), raw: argv.includes('--raw') };
+  const result = await emitEngineFetchResult(prepared._engineRequest, undefined, { env }, outputMode);
+  if (outputMode.json)
+    process.stdout.write(`${result.text}\n`);
+  else
+    process.stdout.write(result.text);
+  return true;
+}
+
+/**
  * Parse the upstream `### <title>\n<content>` sections from a text response.
  *
  * @param {string} text
@@ -1413,7 +1695,6 @@ function runCleanup(argv) {
       console.log('No .playwright-cli directory to clean.');
     return;
   }
-
   const cutoff = Date.now() - (isFinite(days) && days >= 0 ? days : 7) * 24 * 60 * 60 * 1000;
   const entries = fsSync.readdirSync(outputDir);
   let removed = 0;
@@ -1456,5 +1737,7 @@ module.exports = {
   prepareCommandArgs,
   resolveEvalOutputPath,
   runCleanup,
+  runEngineFetch,
+  runEngineFetchFromArgv,
   successPayload,
 };
