@@ -1,12 +1,12 @@
 {
-  "name": "stealth-browser-cli",
+  "name": "stealth-web-cli",
   "version": "0.1.21",
-  "description": "Stealth browser automation CLI on CloakBrowser, with opt-in Patchright and Camoufox provider fallbacks",
+  "description": "Stealth web automation CLI on CloakBrowser, with opt-in Patchright and Camoufox provider fallbacks",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Sekinal/stealth-browser-cli.git"
+    "url": "git+https://github.com/Sekinal/stealth-web-cli.git"
   },
-  "homepage": "https://github.com/Sekinal/stealth-browser-cli",
+  "homepage": "https://github.com/Sekinal/stealth-web-cli",
   "engines": {
     "node": ">=20"
   },
@@ -35,6 +35,6 @@
   },
   "bin": {
     "playwright-cli": "playwright-cli.js",
-    "stealth-browser-cli": "playwright-cli.js"
+    "stealth-web-cli": "playwright-cli.js"
   }
 }

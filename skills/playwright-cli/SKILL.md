@@ -211,7 +211,9 @@ The default provider is CloakBrowser only. Patchright and Camoufox are opt-in th
 `PLAYWRIGHT_CLI_BROWSER_PROVIDER` (or an explicit comma-separated fallback order). Install
 Patchright's browser explicitly with `playwright-cli install-browser chrome-for-testing`; Camoufox's
 first explicitly selected open waits for its browser download. An explicit provider selection
-overrides upstream browser environment variables for that launch.
+overrides upstream browser environment variables for that launch. Ambient upstream variables such
+as `PLAYWRIGHT_MCP_BROWSER` do not skip stealth selection — only `--browser`, `--config`, and
+`PLAYWRIGHT_MCP_CONFIG` do.
 
 ```bash
 playwright-cli list --json

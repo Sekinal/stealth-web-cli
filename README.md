@@ -1,4 +1,4 @@
-# stealth-browser-cli
+# stealth-web-cli
 
 Stealth Browser CLI with SKILLS
 
@@ -23,8 +23,8 @@ This package provides CLI interface into Playwright. If you are using **coding a
 ## Installation
 
 ```bash
-npm install -g stealth-browser-cli
-stealth-browser-cli --help
+npm install -g stealth-web-cli
+stealth-web-cli --help
 ```
 
 ### Installing skills
@@ -32,16 +32,16 @@ stealth-browser-cli --help
 Claude Code, GitHub Copilot and others will use the locally installed skills.
 
 ```bash
-stealth-browser-cli install --skills
+stealth-web-cli install --skills
 ```
 
 ### Skills-less operation
 
-Point your agent at the CLI and let it cook. It'll read the skill off `stealth-browser-cli --help` on its own:
+Point your agent at the CLI and let it cook. It'll read the skill off `stealth-web-cli --help` on its own:
 
 ```
-Test the "add todo" flow on https://demo.playwright.dev/todomvc using stealth-browser-cli.
-Check stealth-browser-cli --help for available commands.
+Test the "add todo" flow on https://demo.playwright.dev/todomvc using stealth-web-cli.
+Check stealth-web-cli --help for available commands.
 ```
 
 ## Demo
@@ -54,14 +54,14 @@ Check stealth-browser-cli --help for available commands.
 Your agent will be running commands, but it does not mean you can't play with it manually:
 
 ```
-stealth-browser-cli open https://demo.playwright.dev/todomvc/ --headed
-stealth-browser-cli type "Buy groceries"
-stealth-browser-cli press Enter
-stealth-browser-cli type "Water flowers"
-stealth-browser-cli press Enter
-stealth-browser-cli check e21
-stealth-browser-cli check e35
-stealth-browser-cli screenshot
+stealth-web-cli open https://demo.playwright.dev/todomvc/ --headed
+stealth-web-cli type "Buy groceries"
+stealth-web-cli press Enter
+stealth-web-cli type "Water flowers"
+stealth-web-cli press Enter
+stealth-web-cli check e21
+stealth-web-cli check e35
+stealth-web-cli screenshot
 ```
 
 ## Headed operation
@@ -69,7 +69,7 @@ stealth-browser-cli screenshot
 Stealth Browser CLI is headless by default. If you'd like to see the browser, pass `--headed` to `open`:
 
 ```bash
-stealth-browser-cli open https://playwright.dev --headed
+stealth-web-cli open https://playwright.dev --headed
 ```
 
 ## Sessions
@@ -82,18 +82,18 @@ You can use different instances of the browser for different projects with sessi
 the invocation to talk to a specific browser.
 
 ```bash
-stealth-browser-cli open https://playwright.dev
-stealth-browser-cli -s=example open https://example.com --persistent
-stealth-browser-cli list
+stealth-web-cli open https://playwright.dev
+stealth-web-cli -s=example open https://example.com --persistent
+stealth-web-cli list
 ```
 
 For login-walled sites, keep a named persistent session so cookies survive browser restarts. After
 finishing a manual login in headed mode, save a portable storage-state backup as well:
 
 ```bash
-stealth-browser-cli -s=social open https://example.com/login --headed --persistent
+stealth-web-cli -s=social open https://example.com/login --headed --persistent
 # complete the login in the browser window, then:
-stealth-browser-cli -s=social state-save auth.json
+stealth-web-cli -s=social state-save auth.json
 # later, reuse the persistent session or restore the backup with state-load auth.json
 ```
 
@@ -108,19 +108,19 @@ Or instruct it to prepend `-s=` to the calls.
 Manage your sessions as follows:
 
 ```bash
-stealth-browser-cli list                     # list all sessions
-stealth-browser-cli close-all                # close all browsers
-stealth-browser-cli kill-all                 # forcefully kill all browser processes
+stealth-web-cli list                     # list all sessions
+stealth-web-cli close-all                # close all browsers
+stealth-web-cli kill-all                 # forcefully kill all browser processes
 ```
 
 ## Monitoring
 
-Use `stealth-browser-cli show` to open a visual dashboard that lets you see and control all running
+Use `stealth-web-cli show` to open a visual dashboard that lets you see and control all running
 browser sessions. This is useful when your coding agents are running browser automation in the
 background and you want to observe their progress or step in to help.
 
 ```bash
-stealth-browser-cli show
+stealth-web-cli show
 ```
 
 <img width="1107" height="729" alt="Image" src="https://github.com/user-attachments/assets/99df739d-106a-4520-b004-bb315db41da7" />
@@ -140,151 +140,151 @@ From the grid you can also close running sessions or delete data for inactive on
 ### Core
 
 ```bash
-stealth-browser-cli open [url]               # open browser, optionally navigate to url
-stealth-browser-cli goto <url>               # navigate to a url
-stealth-browser-cli goto <url> --timeout=5   # navigate with an explicit timeout in seconds
-stealth-browser-cli close                    # close the page
-stealth-browser-cli type <text>              # type text into editable element
-stealth-browser-cli click <ref> [button]     # perform click on a web page
-stealth-browser-cli dblclick <ref> [button]  # perform double click on a web page
-stealth-browser-cli fill <ref> <text>        # fill text into editable element
-stealth-browser-cli fill <ref> <text> --submit # fill and press Enter
-stealth-browser-cli drag <startRef> <endRef> # perform drag and drop between two elements
-stealth-browser-cli drop <ref> --path=<file> # drop files onto an element (from outside the page)
-stealth-browser-cli drop <ref> --data="k=v"  # drop data onto an element
-stealth-browser-cli hover <ref>              # hover over element on page
-stealth-browser-cli select <ref> <val>       # select an option in a dropdown
-stealth-browser-cli upload <file>            # upload one or multiple files
-stealth-browser-cli check <ref>              # check a checkbox or radio button
-stealth-browser-cli uncheck <ref>            # uncheck a checkbox or radio button
-stealth-browser-cli snapshot                 # capture page snapshot to obtain element ref
-stealth-browser-cli snapshot --filename=f    # save snapshot to specific file
-stealth-browser-cli snapshot --inline        # return snapshot content directly
-stealth-browser-cli snapshot <ref>           # snapshot a specific element
-stealth-browser-cli snapshot --depth=N       # limit snapshot depth for efficiency
-stealth-browser-cli eval <func> [ref]        # evaluate javascript expression on page or element
-stealth-browser-cli eval <func> --output=f   # save the raw evaluation value to an absolute file path
-stealth-browser-cli dialog-accept [prompt]   # accept a dialog
-stealth-browser-cli dialog-dismiss           # dismiss a dialog
-stealth-browser-cli resize <w> <h>           # resize the browser window
+stealth-web-cli open [url]               # open browser, optionally navigate to url
+stealth-web-cli goto <url>               # navigate to a url
+stealth-web-cli goto <url> --timeout=5   # navigate with an explicit timeout in seconds
+stealth-web-cli close                    # close the page
+stealth-web-cli type <text>              # type text into editable element
+stealth-web-cli click <ref> [button]     # perform click on a web page
+stealth-web-cli dblclick <ref> [button]  # perform double click on a web page
+stealth-web-cli fill <ref> <text>        # fill text into editable element
+stealth-web-cli fill <ref> <text> --submit # fill and press Enter
+stealth-web-cli drag <startRef> <endRef> # perform drag and drop between two elements
+stealth-web-cli drop <ref> --path=<file> # drop files onto an element (from outside the page)
+stealth-web-cli drop <ref> --data="k=v"  # drop data onto an element
+stealth-web-cli hover <ref>              # hover over element on page
+stealth-web-cli select <ref> <val>       # select an option in a dropdown
+stealth-web-cli upload <file>            # upload one or multiple files
+stealth-web-cli check <ref>              # check a checkbox or radio button
+stealth-web-cli uncheck <ref>            # uncheck a checkbox or radio button
+stealth-web-cli snapshot                 # capture page snapshot to obtain element ref
+stealth-web-cli snapshot --filename=f    # save snapshot to specific file
+stealth-web-cli snapshot --inline        # return snapshot content directly
+stealth-web-cli snapshot <ref>           # snapshot a specific element
+stealth-web-cli snapshot --depth=N       # limit snapshot depth for efficiency
+stealth-web-cli eval <func> [ref]        # evaluate javascript expression on page or element
+stealth-web-cli eval <func> --output=f   # save the raw evaluation value to an absolute file path
+stealth-web-cli dialog-accept [prompt]   # accept a dialog
+stealth-web-cli dialog-dismiss           # dismiss a dialog
+stealth-web-cli resize <w> <h>           # resize the browser window
 ```
 
 ### Navigation
 
 ```bash
-stealth-browser-cli go-back                  # go back to the previous page
-stealth-browser-cli go-forward               # go forward to the next page
-stealth-browser-cli reload                   # reload the current page
+stealth-web-cli go-back                  # go back to the previous page
+stealth-web-cli go-forward               # go forward to the next page
+stealth-web-cli reload                   # reload the current page
 ```
 
 ### Keyboard
 
 ```bash
-stealth-browser-cli press <key>              # press a key on the keyboard, `a`, `arrowleft`
-stealth-browser-cli keydown <key>            # press a key down on the keyboard
-stealth-browser-cli keyup <key>              # press a key up on the keyboard
+stealth-web-cli press <key>              # press a key on the keyboard, `a`, `arrowleft`
+stealth-web-cli keydown <key>            # press a key down on the keyboard
+stealth-web-cli keyup <key>              # press a key up on the keyboard
 ```
 
 ### Mouse
 
 ```bash
-stealth-browser-cli mousemove <x> <y>        # move mouse to a given position
-stealth-browser-cli mousedown [button]       # press mouse down
-stealth-browser-cli mouseup [button]         # press mouse up
-stealth-browser-cli mousewheel <dx> <dy>     # scroll mouse wheel
+stealth-web-cli mousemove <x> <y>        # move mouse to a given position
+stealth-web-cli mousedown [button]       # press mouse down
+stealth-web-cli mouseup [button]         # press mouse up
+stealth-web-cli mousewheel <dx> <dy>     # scroll mouse wheel
 ```
 
 ### Save as
 
 ```bash
-stealth-browser-cli screenshot [ref]         # screenshot of the current page or element
-stealth-browser-cli screenshot --filename=f  # save screenshot with specific filename
-stealth-browser-cli pdf                      # save page as pdf
-stealth-browser-cli pdf --filename=page.pdf  # save pdf with specific filename
+stealth-web-cli screenshot [ref]         # screenshot of the current page or element
+stealth-web-cli screenshot --filename=f  # save screenshot with specific filename
+stealth-web-cli pdf                      # save page as pdf
+stealth-web-cli pdf --filename=page.pdf  # save pdf with specific filename
 ```
 
 ### Tabs
 
 ```bash
-stealth-browser-cli tab-list                 # list all tabs
-stealth-browser-cli tab-new [url]            # create a new tab
-stealth-browser-cli tab-close [index]        # close a browser tab
-stealth-browser-cli tab-select <index>       # select a browser tab
+stealth-web-cli tab-list                 # list all tabs
+stealth-web-cli tab-new [url]            # create a new tab
+stealth-web-cli tab-close [index]        # close a browser tab
+stealth-web-cli tab-select <index>       # select a browser tab
 ```
 
 ### Storage
 
 ```bash
-stealth-browser-cli state-save [filename]    # save storage state
-stealth-browser-cli state-load <filename>    # load storage state
+stealth-web-cli state-save [filename]    # save storage state
+stealth-web-cli state-load <filename>    # load storage state
 
 # Cookies
-stealth-browser-cli cookie-list [--domain]   # list cookies
-stealth-browser-cli cookie-get <name>        # get a cookie
-stealth-browser-cli cookie-set <name> <val>  # set a cookie
-stealth-browser-cli cookie-delete <name>     # delete a cookie
-stealth-browser-cli cookie-clear             # clear all cookies
+stealth-web-cli cookie-list [--domain]   # list cookies
+stealth-web-cli cookie-get <name>        # get a cookie
+stealth-web-cli cookie-set <name> <val>  # set a cookie
+stealth-web-cli cookie-delete <name>     # delete a cookie
+stealth-web-cli cookie-clear             # clear all cookies
 
 # LocalStorage
-stealth-browser-cli localstorage-list        # list localStorage entries
-stealth-browser-cli localstorage-get <key>   # get localStorage value
-stealth-browser-cli localstorage-set <k> <v> # set localStorage value
-stealth-browser-cli localstorage-delete <k>  # delete localStorage entry
-stealth-browser-cli localstorage-clear       # clear all localStorage
+stealth-web-cli localstorage-list        # list localStorage entries
+stealth-web-cli localstorage-get <key>   # get localStorage value
+stealth-web-cli localstorage-set <k> <v> # set localStorage value
+stealth-web-cli localstorage-delete <k>  # delete localStorage entry
+stealth-web-cli localstorage-clear       # clear all localStorage
 
 # SessionStorage
-stealth-browser-cli sessionstorage-list      # list sessionStorage entries
-stealth-browser-cli sessionstorage-get <k>   # get sessionStorage value
-stealth-browser-cli sessionstorage-set <k> <v> # set sessionStorage value
-stealth-browser-cli sessionstorage-delete <k>  # delete sessionStorage entry
-stealth-browser-cli sessionstorage-clear     # clear all sessionStorage
+stealth-web-cli sessionstorage-list      # list sessionStorage entries
+stealth-web-cli sessionstorage-get <k>   # get sessionStorage value
+stealth-web-cli sessionstorage-set <k> <v> # set sessionStorage value
+stealth-web-cli sessionstorage-delete <k>  # delete sessionStorage entry
+stealth-web-cli sessionstorage-clear     # clear all sessionStorage
 ```
 
 ### Network
 
 ```bash
-stealth-browser-cli route <pattern> [opts]   # mock network requests
-stealth-browser-cli route-list               # list active routes
-stealth-browser-cli unroute [pattern]        # remove route(s)
+stealth-web-cli route <pattern> [opts]   # mock network requests
+stealth-web-cli route-list               # list active routes
+stealth-web-cli unroute [pattern]        # remove route(s)
 ```
 
 ### DevTools
 
 ```bash
-stealth-browser-cli console [min-level]      # list console messages
-stealth-browser-cli requests                 # list all network requests since loading the page
-stealth-browser-cli request <index>          # show details for a specific request
-stealth-browser-cli run-code <code>          # run playwright code snippet
-stealth-browser-cli run-code --filename=f    # run playwright code from a file
-stealth-browser-cli tracing-start            # start trace recording
-stealth-browser-cli tracing-stop             # stop trace recording
-stealth-browser-cli video-start [filename]   # start video recording
-stealth-browser-cli video-chapter <title>    # add a chapter marker to the video
-stealth-browser-cli video-show-actions       # annotate each action with a callout in the video
-stealth-browser-cli video-hide-actions       # stop annotating actions in the video
-stealth-browser-cli video-stop               # stop video recording
-stealth-browser-cli show                     # open the visual dashboard
-stealth-browser-cli show --annotate          # launch dashboard for UI review / design feedback
-stealth-browser-cli generate-locator <ref>   # generate a playwright locator for an element
-stealth-browser-cli highlight <ref>          # show a persistent highlight overlay
-stealth-browser-cli highlight <ref> --style= # highlight with a custom CSS style
-stealth-browser-cli highlight <ref> --hide   # hide highlight on a specific element
-stealth-browser-cli highlight --hide         # hide all page highlights
+stealth-web-cli console [min-level]      # list console messages
+stealth-web-cli requests                 # list all network requests since loading the page
+stealth-web-cli request <index>          # show details for a specific request
+stealth-web-cli run-code <code>          # run playwright code snippet
+stealth-web-cli run-code --filename=f    # run playwright code from a file
+stealth-web-cli tracing-start            # start trace recording
+stealth-web-cli tracing-stop             # stop trace recording
+stealth-web-cli video-start [filename]   # start video recording
+stealth-web-cli video-chapter <title>    # add a chapter marker to the video
+stealth-web-cli video-show-actions       # annotate each action with a callout in the video
+stealth-web-cli video-hide-actions       # stop annotating actions in the video
+stealth-web-cli video-stop               # stop video recording
+stealth-web-cli show                     # open the visual dashboard
+stealth-web-cli show --annotate          # launch dashboard for UI review / design feedback
+stealth-web-cli generate-locator <ref>   # generate a playwright locator for an element
+stealth-web-cli highlight <ref>          # show a persistent highlight overlay
+stealth-web-cli highlight <ref> --style= # highlight with a custom CSS style
+stealth-web-cli highlight <ref> --hide   # hide highlight on a specific element
+stealth-web-cli highlight --hide         # hide all page highlights
 ```
 
 ### Open parameters
 
 ```bash
-stealth-browser-cli open --browser=chrome    # use specific browser
-stealth-browser-cli attach --extension=chrome # connect via Playwright Extension
-stealth-browser-cli attach --cdp=chrome      # attach to running Chrome/Edge by channel
-stealth-browser-cli attach --cdp=<url>       # attach via CDP endpoint
-stealth-browser-cli detach                   # detach an attached session, leaves the external browser running
-stealth-browser-cli open --persistent        # use persistent profile
-stealth-browser-cli open --profile=<path>    # use custom profile directory
-stealth-browser-cli open --config=file.json  # use config file
-stealth-browser-cli close                    # close the browser
-stealth-browser-cli delete-data              # delete user data for default session
+stealth-web-cli open --browser=chrome    # use specific browser
+stealth-web-cli attach --extension=chrome # connect via Playwright Extension
+stealth-web-cli attach --cdp=chrome      # attach to running Chrome/Edge by channel
+stealth-web-cli attach --cdp=<url>       # attach via CDP endpoint
+stealth-web-cli detach                   # detach an attached session, leaves the external browser running
+stealth-web-cli open --persistent        # use persistent profile
+stealth-web-cli open --profile=<path>    # use custom profile directory
+stealth-web-cli open --config=file.json  # use config file
+stealth-web-cli close                    # close the browser
+stealth-web-cli delete-data              # delete user data for default session
 ```
 
 By default, this fork opens new sessions with CloakBrowser only. Patchright and Camoufox are opt-in:
@@ -305,7 +305,7 @@ is reported. Camoufox's browser
 binary is installed only when Camoufox is explicitly selected; a fresh selection waits for that
 download to finish and uses Playwright's Firefox transport while the other providers retain
 Patchright. Patchright's Chrome for Testing browser can be installed explicitly with
-`stealth-browser-cli install-browser chrome-for-testing`. An explicit
+`stealth-web-cli install-browser chrome-for-testing`. An explicit
 `PLAYWRIGHT_CLI_BROWSER_PROVIDER` takes precedence over conflicting upstream browser environment
 variables.
 
@@ -330,8 +330,8 @@ the same provenance.
 ```
 
 ```bash
-stealth-browser-cli goto https://example.com --timeout=5 --json
-stealth-browser-cli eval '() => document.title' --json
+stealth-web-cli goto https://example.com --timeout=5 --json
+stealth-web-cli eval '() => document.title' --json
 ```
 
 Use `eval --output=<file>` when the result is too large for terminal output. String results are written
@@ -341,10 +341,10 @@ available when a JSON-serialized file is desired.
 
 ### Snapshots
 
-After each command, stealth-browser-cli provides a snapshot of the current browser state.
+After each command, stealth-web-cli provides a snapshot of the current browser state.
 
 ```bash
-> stealth-browser-cli goto https://example.com
+> stealth-web-cli goto https://example.com
 ### Page
 - Page URL: https://example.com/
 - Page Title: Example Domain
@@ -352,27 +352,27 @@ After each command, stealth-browser-cli provides a snapshot of the current brows
 [Snapshot](.playwright-cli/page-2026-02-14T19-22-42-679Z.yml)
 ```
 
-You can also take a snapshot on demand using `stealth-browser-cli snapshot` command. All the options below can be combined as needed.
+You can also take a snapshot on demand using `stealth-web-cli snapshot` command. All the options below can be combined as needed.
 
 ```bash
 # default - save to a file with timestamp-based name
-stealth-browser-cli snapshot
+stealth-web-cli snapshot
 
 # save to file, use when snapshot is a part of the workflow result
-stealth-browser-cli snapshot --filename=after-click.yaml
+stealth-web-cli snapshot --filename=after-click.yaml
 
 # return snapshot content inline (especially useful with --json)
-stealth-browser-cli snapshot --inline --json
+stealth-web-cli snapshot --inline --json
 
 # snapshot an element instead of the whole page
-stealth-browser-cli snapshot "#main"
+stealth-web-cli snapshot "#main"
 
 # limit snapshot depth for efficiency, take a partial snapshot afterwards
-stealth-browser-cli snapshot --depth=4
-stealth-browser-cli snapshot e34
+stealth-web-cli snapshot --depth=4
+stealth-web-cli snapshot e34
 
 # include each element's bounding box as [box=x,y,width,height]
-stealth-browser-cli snapshot --boxes
+stealth-web-cli snapshot --boxes
 ```
 
 ### Targeting elements
@@ -381,48 +381,48 @@ By default, use refs from the snapshot to interact with page elements.
 
 ```bash
 # get snapshot with refs
-stealth-browser-cli snapshot
+stealth-web-cli snapshot
 
 # interact using a ref
-stealth-browser-cli click e15
+stealth-web-cli click e15
 ```
 
 You can also use css selectors or Playwright locators.
 
 ```bash
 # css selector
-stealth-browser-cli click "#main > button.submit"
+stealth-web-cli click "#main > button.submit"
 
 # role locator
-stealth-browser-cli click "getByRole('button', { name: 'Submit' })"
+stealth-web-cli click "getByRole('button', { name: 'Submit' })"
 
 # test id
-stealth-browser-cli click "getByTestId('submit-button')"
+stealth-web-cli click "getByTestId('submit-button')"
 ```
 
 ### Sessions
 
 ```bash
-stealth-browser-cli -s=name <cmd>            # run command in named session
-stealth-browser-cli -s=name close            # stop a named browser
-stealth-browser-cli -s=name delete-data      # delete user data for named browser
-stealth-browser-cli list                     # list all sessions
-stealth-browser-cli close-all                # close all browsers
-stealth-browser-cli kill-all                 # forcefully kill all browser processes
+stealth-web-cli -s=name <cmd>            # run command in named session
+stealth-web-cli -s=name close            # stop a named browser
+stealth-web-cli -s=name delete-data      # delete user data for named browser
+stealth-web-cli list                     # list all sessions
+stealth-web-cli close-all                # close all browsers
+stealth-web-cli kill-all                 # forcefully kill all browser processes
 ```
 
 ### Local installation
 
-If global `stealth-browser-cli` command is not available, try a local version via `npx stealth-browser-cli`:
+If global `stealth-web-cli` command is not available, try a local version via `npx stealth-web-cli`:
 
 ```bash
-npx --no-install stealth-browser-cli --version
+npx --no-install stealth-web-cli --version
 ```
 
-When local version is available, use `npx stealth-browser-cli` in all commands. Otherwise, install `stealth-browser-cli` as a global command:
+When local version is available, use `npx stealth-web-cli` in all commands. Otherwise, install `stealth-web-cli` as a global command:
 
 ```bash
-npm install -g stealth-browser-cli
+npm install -g stealth-web-cli
 ```
 
 ## Configuration file
@@ -430,7 +430,7 @@ npm install -g stealth-browser-cli
 The Stealth Browser CLI can be configured using a JSON configuration file. You can specify the configuration file using the `--config` command line option:
 
 ```bash
-stealth-browser-cli --config path/to/config.json open example.com
+stealth-web-cli --config path/to/config.json open example.com
 ```
 
 Stealth Browser CLI will load config from `.playwright/cli.config.json` by default so that you did not need to specify it every time.

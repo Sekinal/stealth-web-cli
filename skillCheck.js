@@ -27,8 +27,8 @@ function bundledSkillFile() {
 function installedSkillTargets() {
   const cwd = process.cwd();
   return [
-    { dir: path.join(cwd, '.claude', 'skills', 'playwright-cli'), command: 'stealth-browser-cli install --skills' },
-    { dir: path.join(cwd, '.agents', 'skills', 'playwright-cli'), command: 'stealth-browser-cli install --skills=agents' },
+    { dir: path.join(cwd, '.claude', 'skills', 'playwright-cli'), command: 'stealth-web-cli install --skills' },
+    { dir: path.join(cwd, '.agents', 'skills', 'playwright-cli'), command: 'stealth-web-cli install --skills=agents' },
   ];
 }
 
