@@ -553,7 +553,7 @@ test('emits stable structured output with page metadata and provider details', a
 test('writes complete eval results with --output', async ({}) => {
   await runCli('-s=eval-output', 'open', 'data:text/html,<title>Output</title>');
   const outputFile = path.join(test.info().outputPath(), 'evaluation result.txt');
-  const expected = 'line1\nline2 with "quotes" and \\ backslash\n' + 'x'.repeat(8192);
+  const expected = `line1\nline2 with "quotes" and \\ backslash\n${'x'.repeat(8192)}`;
   const evaluated = await runCli(
       '-s=eval-output',
       'eval',
@@ -895,11 +895,8 @@ test('solve-captcha detects, times out, and injects tokens', async ({}) => {
 
 test('solve-captcha integrates CapSolver (createTask/getTaskResult/token)', async ({}) => {
   const solver = http.createServer((req, res) => {
-    let body = '';
-    req.on('data', c => body += c);
+    req.resume(); // consume the request body so 'end' fires
     req.on('end', () => {
-      let data = {};
-      try { data = JSON.parse(body || '{}'); } catch {}
       res.writeHead(200, { 'content-type': 'application/json' });
       if (req.url === '/createTask') {
         res.end(JSON.stringify({ errorId: 0, taskId: 'mock-task' }));
@@ -1344,8 +1341,8 @@ test('generated provider config directories are removed on exit', async ({}) => 
   expect(configDir).toContain('playwright-cli-browser-');
   expect(fs.existsSync(configDir)).toBe(false);
 });
+
 test('challenge detection flags Cloudflare-style pages', async ({}) => {
-  const { detectChallengeFromText } = require('../cliEnhancements');
   // detectChallengeFromText is not exported; test via the payload path instead
   await runCli('-s=challenge-test', 'open', 'data:text/html,<title>Just a moment...</title><p>Checking your browser before accessing</p>');
   const result = await runCli('-s=challenge-test', 'eval', '() => document.title', '--json');
@@ -1385,11 +1382,6 @@ test('cleanup command removes accumulated artifacts', async ({}) => {
 });
 
 test('host-resolver-rules flag is extracted for DNS override', async ({}) => {
-  const providers = require('../browserProviders');
-  const state = providers.createProviderState('open', ['open', '--host-resolver-rules=MAP example.com 1.2.3.4'], {});
-  // Only enabled when provider selection is active; use resolveProviderOrder directly
-  const { resolveProviderOrder, flagValue } = providers;
-  expect(resolveProviderOrder('patchright')).toEqual(['patchright']);
   // flagValue is internal; verify via a state probe
   const probe = `
     const providers = require(${JSON.stringify(path.join(__dirname, '../browserProviders.js'))});

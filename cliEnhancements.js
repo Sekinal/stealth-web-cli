@@ -140,7 +140,7 @@ function patchSession(Session, options) {
   Session.__stealthCliEnhancements = true;
 
   const originalStartDaemon = Session.startDaemon;
-  Session.startDaemon = async function(clientInfo, cliArgs, mode) {
+  Session.startDaemon = async function(clientInfo, _cliArgs, _mode) {
     const result = await originalStartDaemon.apply(this, arguments);
     const provider = options.env[activeProviderEnvName];
     if (provider) {
@@ -286,7 +286,7 @@ function patchOutput(outputModule, env) {
   if (TextOutput && !TextOutput.__stealthCliEnhancements) {
     TextOutput.__stealthCliEnhancements = true;
     const originalOpen = TextOutput.prototype.open;
-    TextOutput.prototype.open = function(session, pid, toolResult) {
+    TextOutput.prototype.open = function(_session, _pid, _toolResult) {
       originalOpen.apply(this, arguments);
       const provider = providerDetails(env);
       if (provider)
@@ -517,7 +517,7 @@ function prepareCommandArgs(args) {
   for (let i = 0; i < ${maxAttempts}; i++) {
     attempts = i + 1;
     try {
-      response = await page.request.${method.toLowerCase()}(url${requestOptions ? ', { ' + requestOptions + ' }' : ''});
+      response = await page.request.${method.toLowerCase()}(url${requestOptions ? `, { ${requestOptions} }` : ''});
       lastError = null;
     } catch (e) {
       lastError = e;
@@ -1352,6 +1352,7 @@ function serializeUnknownError(error) {
 
 function errorMessage(error) {
   const message = error instanceof Error ? error.message : typeof error === 'string' ? error : serializeUnknownError(error);
+  // eslint-disable-next-line no-control-regex -- the regex exists to strip ANSI escape control characters
   return message.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
 }
 /**
@@ -1373,7 +1374,7 @@ function runCleanup(argv) {
   if (!fsSync.existsSync(outputDir)) {
     const empty = { removed: 0, remaining: 0, dir: outputDir };
     if (json)
-      process.stdout.write(JSON.stringify(empty, null, 2) + '\n');
+      process.stdout.write(`${JSON.stringify(empty, null, 2)}\n`);
     else
       console.log('No .playwright-cli directory to clean.');
     return;
@@ -1399,7 +1400,7 @@ function runCleanup(argv) {
   const remaining = fsSync.readdirSync(outputDir).length;
   const result = { removed, remaining, dir: outputDir };
   if (json)
-    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   else
     console.log(`Removed ${removed} artifact(s); ${remaining} file(s) remain in ${outputDir}`);
 }

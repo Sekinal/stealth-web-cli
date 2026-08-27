@@ -1,0 +1,19 @@
+node_modules/
+test-results/
+.playwright-cli/
+.claude/
+.playwright/
+package-lock.json
+
+# Vendored upstream skill documents — content is compared against upstream;
+# reformatting would break the installed-skill check.
+skills/
+# Human-facing docs keep their existing layout.
+README.md
+CONTRIBUTING.md
+SECURITY.md
+CLAUDE.md
+# Third-party maintained.
+.github/
+scripts/
+playwright-cli.js
