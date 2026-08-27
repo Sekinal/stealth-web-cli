@@ -140,6 +140,7 @@ function patchSession(Session, options) {
   Session.__stealthCliEnhancements = true;
 
   const originalStartDaemon = Session.startDaemon;
+  /** @type {(clientInfo: any, cliArgs: any, mode?: any) => Promise<any>} */
   Session.startDaemon = async function(clientInfo, _cliArgs, _mode) {
     const result = await originalStartDaemon.apply(this, arguments);
     const provider = options.env[activeProviderEnvName];
@@ -184,6 +185,7 @@ function patchSession(Session, options) {
   }
 
   const originalRun = Session.prototype.run;
+  /** @type {(this: any, clientInfo: any, args: any, runOptions: any) => Promise<any>} */
   Session.prototype.run = async function(clientInfo, args, runOptions) {
     const evalOutputPath = resolveEvalOutputPath(args);
     const preparedArgs = prepareCommandArgs(args);
@@ -237,14 +239,15 @@ function patchSession(Session, options) {
       }
 
       const [page, consoleEntries] = await readSessionContext(originalRun, this, clientInfo);
-      const normalizedResult = normalizeCommandResult(args._?.[0], normalizeUpstreamResult(upstreamPayload));
+      /** @type {Record<string, any>} */
+      const normalizedResult = /** @type {Record<string, any>} */ (normalizeCommandResult(args._?.[0], normalizeUpstreamResult(upstreamPayload)));
       const cmd = args._?.[0];
       if (cmd === 'fetch' && normalizedResult && typeof normalizedResult === 'object' && !Array.isArray(normalizedResult)) {
         const fetchChallenge = detectChallengeFromText(null, typeof normalizedResult.body === 'string' ? normalizedResult.body : '', typeof normalizedResult.status === 'number' ? normalizedResult.status : null);
         if (fetchChallenge.blocked)
           normalizedResult.challenge = fetchChallenge;
       }
-      if ((cmd === 'fetch' || cmd === 'goto') && normalizedResult && typeof normalizedResult === 'object' && normalizedResult.failed) {
+      if ((cmd === 'fetch' || cmd === 'goto') && normalizedResult && !Array.isArray(normalizedResult) && typeof normalizedResult === 'object' && normalizedResult.failed) {
         const payload = {
           ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), fallbackDetailsForSession(this, options.env), proxyDetails(options.env)),
           ok: false,
@@ -264,13 +267,15 @@ function patchSession(Session, options) {
     } catch (error) {
       if (runOptions?.json) {
         const [page, consoleEntries] = await readSessionContext(originalRun, this, clientInfo);
-        if (error && typeof error === 'object')
-          error.cliJson = failurePayload(
+        if (error && typeof error === 'object') {
+          const taggedError = /** @type {Record<string, any>} */ (error);
+          taggedError.cliJson = failurePayload(
               error,
               page,
               consoleEntries,
               providerDetailsForSession(this, options.env),
               fallbackDetailsForSession(this, options.env));
+        }
       }
       throw error;
     }
@@ -284,8 +289,8 @@ function patchSession(Session, options) {
 function patchOutput(outputModule, env) {
   const TextOutput = outputModule.TextOutput;
   if (TextOutput && !TextOutput.__stealthCliEnhancements) {
-    TextOutput.__stealthCliEnhancements = true;
     const originalOpen = TextOutput.prototype.open;
+    /** @type {(this: any, session: any, pid: any, toolResult: any) => void} */
     TextOutput.prototype.open = function(_session, _pid, _toolResult) {
       originalOpen.apply(this, arguments);
       const provider = providerDetails(env);
@@ -296,8 +301,8 @@ function patchOutput(outputModule, env) {
 
   const JsonOutput = outputModule.JsonOutput;
   if (JsonOutput && !JsonOutput.__stealthCliEnhancements) {
-    JsonOutput.__stealthCliEnhancements = true;
     const originalEmit = JsonOutput.prototype._emit;
+    /** @type {(this: any, value: any) => any} */
     JsonOutput.prototype._emit = function(value) {
       let payload;
       if (value?.result?.ok !== undefined && value.session) {
@@ -794,6 +799,9 @@ function readSessionContext(originalRun, session, clientInfo) {
  * @param {Function} originalRun
  * @param {any} session
  * @param {any} clientInfo
+ * @returns {Promise<{ url: string | null, title: string | null, bodyLength: number | null,
+ *   emptyBody: boolean, webdriver: boolean,
+ *   challenge?: { type: string, blocked: boolean } } | undefined>}
  */
 async function readPageMetadata(originalRun, session, clientInfo) {
   try {
@@ -816,17 +824,18 @@ async function readPageMetadata(originalRun, session, clientInfo) {
       }`],
     }, { json: true, raw: false });
     const payload = normalizeUpstreamResult(parseJsonText(response.text));
-    if (payload && typeof payload === 'object') {
-      const title = stringOrNull(payload.title);
-      const bodyText = stringOrNull(payload.bodyText) ?? '';
-      const bodyLength = typeof payload.bodyLength === 'number' ? payload.bodyLength : null;
-      const challenge = detectCaptchaChallenge(title, bodyText, payload.captcha);
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      const record = /** @type {Record<string, any>} */ (payload);
+      const title = stringOrNull(record.title);
+      const bodyText = stringOrNull(record.bodyText) ?? '';
+      const bodyLength = typeof record.bodyLength === 'number' ? record.bodyLength : null;
+      const challenge = detectCaptchaChallenge(title, bodyText, record.captcha);
       return {
-        url: stringOrNull(payload.url),
+        url: stringOrNull(record.url),
         title,
         bodyLength,
         emptyBody: bodyLength === 0,
-        webdriver: !!payload.webdriver,
+        webdriver: !!record.webdriver,
         challenge,
       };
     }
@@ -1014,7 +1023,7 @@ function parseRequestDetail(text) {
     responseHeaders: /** @type {Record<string, string>} */ ({}),
   };
 
-  let section = '';
+  let section = /** @type {null | 'general' | 'requestHeaders' | 'responseHeaders'} */ (null);
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (trimmed === 'General') { section = 'general'; continue; }
@@ -1033,6 +1042,11 @@ function parseRequestDetail(text) {
   return result;
 }
 
+/**
+ * Unwrap upstream payloads of the shape `{ result: ... }`.
+ * @param {unknown} value
+ * @returns {unknown}
+ */
 function normalizeUpstreamResult(value) {
   if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 1 && 'result' in value)
     return parseJsonText(value.result);
@@ -1070,6 +1084,16 @@ function parseUpstreamSections(text) {
 }
 
 /**
+ * Parse console text output into trimmed non-empty lines, dropping the
+ * upstream "Total messages:" summary header.
+ *
+ * @param {string} text
+ * @returns {string[]}
+ */
+function parseConsoleText(text) {
+  return text.split(/\r?\n/).map(line => line.trim()).filter(line => line && !/^Total messages:/i.test(line));
+}
+/**
  * Extract the host from a URL for cross-host redirect warnings.
  *
  * @param {string} url
@@ -1081,12 +1105,14 @@ function hostOfUrl(url) {
 }
 
 /**
- * @param {string} text
+ * Keyword-based challenge detection for text bodies that lack DOM widget
+ * signals (e.g. the challenge lives inside a cross-origin iframe).
+ *
+ * @param {string | null} title
+ * @param {string} bodyText
+ * @param {number | null} [status]
+ * @returns {{ type: string, blocked: boolean }}
  */
-function parseConsoleText(text) {
-  return text.split(/\r?\n/).map(line => line.trim()).filter(line => line && !/^Total messages:/i.test(line));
-}
-
 function detectChallengeFromText(title, bodyText, status) {
   const lower = `${title ?? ''} ${bodyText ?? ''}`.toLowerCase();
   if (lower.includes('just a moment') || lower.includes('checking your browser') || lower.includes('enable javascript'))
@@ -1128,11 +1154,15 @@ function detectCaptchaChallenge(title, bodyText, captcha, status) {
 }
 
 /**
- * @param {{ url: string | null, title: string | null } | undefined} page
+ * Build the standard success payload returned by --json commands.
+ *
+ * @param {{ url: string | null, title: string | null, bodyLength?: number | null,
+ *   emptyBody?: boolean, webdriver?: boolean, challenge?: { type: string, blocked: boolean } } | undefined} page
  * @param {unknown} result
  * @param {string[]} consoleEntries
  * @param {{ name: string, version: string } | undefined} provider
  * @param {{ requested: string, active: string, reason: string } | undefined} fallback
+ * @param {{ server: string, bypass?: string } | undefined} proxy
  */
 function successPayload(page, result, consoleEntries, provider, fallback, proxy) {
   return {
@@ -1176,7 +1206,7 @@ function failurePayload(error, page, consoleEntries = [], provider, fallback) {
  * the upstream env contract (PLAYWRIGHT_MCP_*) plus conventional HTTP(S)_PROXY.
  *
  * @param {NodeJS.ProcessEnv} env
- * @returns {{ server: string, bypass: string | undefined } | undefined}
+ * @returns {{ server: string, bypass?: string } | undefined}
  */
 function proxyDetails(env) {
   const server = env.PLAYWRIGHT_MCP_PROXY_SERVER || env.HTTPS_PROXY || env.HTTP_PROXY;
@@ -1246,7 +1276,7 @@ function inferProviderDetails(config) {
   const browser = config?.browser;
   const launchOptions = browser?.launchOptions ?? {};
   const executablePath = typeof launchOptions.executablePath === 'string' ? launchOptions.executablePath.toLowerCase() : '';
-  const args = Array.isArray(launchOptions.args) ? launchOptions.args : [];
+  const args = /** @type {unknown[]} */ (Array.isArray(launchOptions.args) ? launchOptions.args : []);
   const hasStealthContext = browser?.contextOptions?.userAgent !== undefined
     || browser?.contextOptions?.viewport === null;
   if (launchOptions.channel === 'chrome-for-testing' && hasStealthContext)
@@ -1350,6 +1380,10 @@ function serializeUnknownError(error) {
   }
 }
 
+/**
+ * @param {unknown} error
+ * @returns {string}
+ */
 function errorMessage(error) {
   const message = error instanceof Error ? error.message : typeof error === 'string' ? error : serializeUnknownError(error);
   // eslint-disable-next-line no-control-regex -- the regex exists to strip ANSI escape control characters

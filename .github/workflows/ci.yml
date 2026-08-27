@@ -20,6 +20,8 @@ jobs:
       run: npm ci
     - name: Lint
       run: npm run lint
+    - name: Typecheck JSDoc sources
+      run: npm run typecheck
 
   test:
     strategy:

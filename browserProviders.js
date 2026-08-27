@@ -40,7 +40,7 @@ async function configureBrowserProviderFallbacks(options) {
   if (!sessionClass || typeof sessionClass.startDaemon !== 'function')
     throw new Error('Unable to configure browser providers: Session.startDaemon was not found.');
 
-  const originalStartDaemon = sessionClass.startDaemon;
+  const originalStartDaemon = /** @type {typeof sessionClass.startDaemon & { __browserProviderFallbacks?: boolean }} */ (sessionClass.startDaemon);
   if (originalStartDaemon.__browserProviderFallbacks)
     return { enabled: true, providers: state.providers };
 
@@ -49,12 +49,12 @@ async function configureBrowserProviderFallbacks(options) {
   delete env[fallbackEnvName];
   let providerIndex = await activateFirstAvailableProvider(state, env, stderr, activate);
 
-  sessionClass.startDaemon = async function(...args) {
+  sessionClass.startDaemon = async function(/** @type {any[]} */ ...args) {
     let lastError;
     while (providerIndex < state.providers.length) {
       const provider = state.providers[providerIndex];
       try {
-        const startDaemon = provider === 'camoufox' ? camoufoxStartDaemon(undefined, env) : originalStartDaemon;
+        const startDaemon = /** @type {(this: any, ...args: any[]) => any} */ (provider === 'camoufox' ? camoufoxStartDaemon(undefined, env) : originalStartDaemon);
         return await startDaemon.apply(this, args);
       } catch (error) {
         lastError = error;
@@ -90,11 +90,18 @@ async function configureBrowserProviderFallbacks(options) {
     }
     throw lastError;
   };
-  sessionClass.startDaemon.__browserProviderFallbacks = true;
+  /** Marker so repeated configuration is a no-op. */
+  const taggedDaemon = /** @type {typeof sessionClass.startDaemon & { __browserProviderFallbacks?: boolean }} */ (sessionClass.startDaemon);
+  taggedDaemon.__browserProviderFallbacks = true;
 
   return { enabled: true, providers: state.providers };
 }
 
+/**
+ * @param {{ sessionModule?: any, registryModule?: any } | undefined} modules
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {(clientInfo: any, cliArgs: any, mode?: any) => Promise<any>}
+ */
 function camoufoxStartDaemon(modules, env = process.env) {
   let { sessionModule, registryModule } = modules ?? {};
   if (!sessionModule || !registryModule) {
@@ -127,6 +134,15 @@ function camoufoxStartDaemon(modules, env = process.env) {
  * @param {string | undefined} command
  * @param {string[]} argv
  * @param {NodeJS.ProcessEnv} env
+ * @returns {{
+ *   enabled: boolean,
+ *   providers: string[],
+ *   originalConfig?: string | undefined,
+ *   configDir?: string,
+ *   configPaths?: Map<string, string>,
+ *   hostResolverRules?: string | undefined,
+ *   dnsServers?: string | undefined,
+ * }}
  */
 function createProviderState(command, argv, env) {
   const providerOverride = env[providerEnvName];
@@ -260,14 +276,16 @@ async function activateProvider(state, provider, env) {
  * @param {string} provider
  */
 async function configPathForProvider(state, provider) {
-  const existingPath = state.configPaths.get(provider);
+  const configPaths = state.configPaths ?? new Map();
+  const configDir = state.configDir ?? createConfigDir();
+  const existingPath = configPaths.get(provider);
   if (existingPath)
     return existingPath;
 
   const config = await configForProvider(provider, state);
-  const configPath = path.join(state.configDir, `${provider}.json`);
+  const configPath = path.join(configDir, `${provider}.json`);
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-  state.configPaths.set(provider, configPath);
+  configPaths.set(provider, configPath);
   return configPath;
 }
 
@@ -346,7 +364,7 @@ async function camoufoxLaunchOptions(launchOptions) {
  * it. Await the package's installer ourselves so the first `open` cannot race
  * a partially extracted browser.
  *
- * @param {{ camoufoxPath: Function, CamoufoxFetcher: new () => { install: Function }} | undefined} pkgman
+ * @param {{ camoufoxPath: Function, CamoufoxFetcher: new () => { install: Function }} | undefined} [pkgman]
  */
 async function ensureCamoufoxInstalled(pkgman) {
   pkgman ??= await import('camoufox-js/dist/pkgman.js');
@@ -474,7 +492,7 @@ function providerVersion(provider, installedVersion = installedProviderVersion) 
   try {
     return installedVersion(packageName);
   } catch {
-    const packageJson = require('./package.json');
+    const packageJson = /** @type {{ dependencies?: Record<string, string>, optionalDependencies?: Record<string, string> }} */ (require('./package.json'));
     const version = packageJson.dependencies?.[packageName] ?? packageJson.optionalDependencies?.[packageName];
     if (!version)
       throw new Error(`Unable to determine the installed or declared version of browser provider '${provider}'.`);
