@@ -509,12 +509,6 @@ function prepareCommandArgs(args) {
       ...(headerArg !== undefined ? parseHeaderArg(headerArg) : {}),
       ...(authHeader ? parseHeaderArg(authHeader) : {}),
     };
-    const hasHeaders = Object.keys(mergedHeaders).length > 0;
-    const requestOptions = [
-      data !== undefined ? `data: ${JSON.stringify(data)}` : '',
-      hasHeaders ? `headers: ${JSON.stringify(mergedHeaders)}` : '',
-      timeoutMs !== undefined ? `timeout: ${timeoutMs}` : '',
-    ].filter(Boolean).join(', ');
     const maxAttempts = retryCount + 1;
 
     // Non-browser engines run in Node before the daemon is ever contacted;
@@ -551,12 +545,29 @@ function prepareCommandArgs(args) {
   for (let i = 0; i < ${maxAttempts}; i++) {
     attempts = i + 1;
     try {
-      response = await page.request.${method.toLowerCase()}(url${requestOptions ? `, { ${requestOptions} }` : ''});
+      // In-page fetch: the request rides CloakBrowser's own network stack
+      // (BoringSSL + Chrome h2), not the Node-side APIRequestContext.
+      response = await page.evaluate(async ({ url, method, data, headers, timeoutMs }) => {
+        const res = await fetch(url, {
+          method,
+          ...(data !== undefined ? { body: data } : {}),
+          ...(headers && Object.keys(headers).length ? { headers } : {}),
+          ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+        });
+        return {
+          status: res.status,
+          statusText: res.statusText,
+          url: res.url,
+          headers: Object.fromEntries(res.headers.entries()),
+          body: await res.text(),
+          redirected: res.redirected,
+        };
+      }, { url, method: ${JSON.stringify(method)}, data: ${JSON.stringify(data)}, headers: ${JSON.stringify(mergedHeaders)}, timeoutMs: ${timeoutMs ?? 'null'} });
       lastError = null;
     } catch (e) {
       lastError = e;
     }
-    const statusNow = response ? response.status() : null;
+    const statusNow = response ? response.status : null;
     const shouldRetry = ${retryCount} > 0 && i < ${maxAttempts} - 1 && (lastError !== null || (statusNow !== null && statusNow >= 500));
     if (!shouldRetry)
       break;
@@ -564,28 +575,19 @@ function prepareCommandArgs(args) {
   }
   if (lastError && !response)
     throw lastError;
-  const status = response.status();
-  const finalUrl = response.url();
-  const redirected = url !== finalUrl;
-  const headers = {};
-  for (const h of response.headersArray())
-    headers[h.name.toLowerCase()] = h.value;
+  const status = response.status;
+  const finalUrl = response.url;
+  const redirected = response.redirected;
+  const headers = response.headers;
   const contentType = headers['content-type'] ?? '';
   const isBinary = /octet-stream|image\\/|application\\/pdf|application\\/zip|application\\/gzip|audio\\/|video\\/|font\\//.test(contentType);
-  let body;
-  let binary = false;
-  if (isBinary) {
-    const buf = await response.body();
-    body = buf.toString('base64');
-    binary = true;
-  } else {
-    body = await response.text();
-  }
+  const body = response.body;
+  const binary = false;
   let json = null;
-  if (!binary) { try { json = JSON.parse(body); } catch {} }
+  if (!binary) { try { json = JSON.parse(body); } catch (_) {} }
   return {
     status,
-    statusText: response.statusText(),
+    statusText: response.statusText,
     url: finalUrl,
     redirected,
     headers,
@@ -593,8 +595,6 @@ function prepareCommandArgs(args) {
     attempts,
     retried: attempts > 1,
     durationMs: Date.now() - startedAt,
-    ...(binary ? { binary: true } : {}),
-    ...(json !== null ? { json } : {}),
     engine: 'browser',
     failed: status >= 400,
   };
