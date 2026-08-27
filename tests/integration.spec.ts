@@ -184,6 +184,27 @@ test('reports declared versions when an optional provider package is unavailable
   })).toBe('0.10.2');
 });
 
+test('package identity is stealth-web-cli with both bin entries', async ({}) => {
+  // Guards the issue #30 rename: the published name, binary name, and repo
+  // URLs must all agree, and the old name must not resurface.
+  const pkg = require('../package.json');
+  expect(pkg.name).toBe('stealth-web-cli');
+  expect(Object.keys(pkg.bin)).toContain('stealth-web-cli');
+  expect(Object.keys(pkg.bin)).toContain('playwright-cli');
+  expect(pkg.repository.url).toContain('github.com/Sekinal/stealth-web-cli');
+  expect(pkg.homepage).toContain('github.com/Sekinal/stealth-web-cli');
+
+  const lock = JSON.parse(fs.readFileSync(path.join(__dirname, '../package-lock.json'), 'utf8'));
+  expect(lock.name).toBe('stealth-web-cli');
+  expect(lock.packages[''].name).toBe('stealth-web-cli');
+  expect(lock.packages[''].bin).toEqual(pkg.bin);
+
+  // The bundled skill install hints must use the new binary name.
+  const skillCheck = fs.readFileSync(path.join(__dirname, '../skillCheck.js'), 'utf8');
+  expect(skillCheck).toContain("command: 'stealth-web-cli install --skills'");
+  expect(skillCheck).not.toContain('stealth-browser-cli');
+});
+
 test('waits for a missing Camoufox browser installation before continuing', async ({}) => {
   const { ensureCamoufoxInstalled } = require('../browserProviders');
   let installed = false;
@@ -1057,6 +1078,40 @@ test('goto --retry retries transient 5xx and reports attempts', async ({}) => {
     expect(payload.result.retried).toBe(true);
     expect(requests).toBe(2);
     await runCli('-s=goto-retry', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('goto warns on stderr when redirected to a different host', async ({}) => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(302, { location: 'https://example.com/' });
+    res.end();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+
+  try {
+    await runCli('-s=goto-redirect-warn', 'open', 'data:text/html,<title>Start</title>');
+    const result = await runCli('-s=goto-redirect-warn', 'goto', `http://127.0.0.1:${address.port}/`, '--timeout=15');
+    // Text mode: warning on stderr, command still succeeds.
+    expect(result.exitCode).toBe(0);
+    expect(result.error).toContain('landed on a different host than requested');
+    expect(result.error).toContain(`127.0.0.1:${address.port}`);
+    expect(result.error).toContain('https://example.com/');
+
+    // Same-host navigation stays silent.
+    const sameHost = await runCli('-s=goto-redirect-warn', 'goto', 'https://example.com', '--timeout=15');
+    expect(sameHost.exitCode).toBe(0);
+    expect(sameHost.error).not.toContain('landed on a different host');
+
+    await runCli('-s=goto-redirect-warn', 'close');
   } finally {
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
