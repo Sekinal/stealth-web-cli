@@ -205,8 +205,24 @@ function patchSession(Session, options) {
             result = { ...result, text: parsed };
         } catch {}
       }
-      if (!runOptions?.json)
+      if (!runOptions?.json) {
+        // Text mode: warn when goto landed on a different host than requested
+        // (issue #8 Bug 2) — --json already reports `redirected`.
+        if (args._?.[0] === 'goto' && !result.isError && !runOptions?.raw) {
+          try {
+            const sections = parseUpstreamSections(result.text);
+            const resultJson = sections.get('Result');
+            if (resultJson) {
+              const parsed = JSON.parse(resultJson);
+              if (parsed?.redirected && typeof parsed.url === 'string') {
+                const requested = typeof args._?.[1] === 'string' ? args._[1] : '';
+                console.error(`[playwright-cli] Warning: goto landed on a different host than requested. Requested: ${hostOfUrl(requested) || requested}; final URL: ${parsed.url}`);
+              }
+            }
+          } catch {}
+        }
         return result;
+      }
 
       const upstreamPayload = parseJsonText(result.text);
       if (result.isError || upstreamPayload?.isError) {
@@ -1034,6 +1050,34 @@ function parseJsonText(value) {
   } catch {
     return value;
   }
+}
+
+/**
+ * Parse the upstream `### <title>\n<content>` sections from a text response.
+ *
+ * @param {string} text
+ * @returns {Map<string, string>}
+ */
+function parseUpstreamSections(text) {
+  const sections = new Map();
+  for (const section of text.split(/^### /m).slice(1)) {
+    const firstNewline = section.indexOf('\n');
+    if (firstNewline === -1)
+      continue;
+    sections.set(section.slice(0, firstNewline), section.slice(firstNewline + 1).trim());
+  }
+  return sections;
+}
+
+/**
+ * Extract the host from a URL for cross-host redirect warnings.
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+function hostOfUrl(url) {
+  const match = typeof url === 'string' ? url.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i) : null;
+  return match ? match[1].toLowerCase() : '';
 }
 
 /**
