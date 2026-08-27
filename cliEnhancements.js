@@ -1190,6 +1190,12 @@ function fallbackDetailsForSession(session, env) {
  * Recovers provider identity for sessions created before sidecar metadata was
  * written, or when a sidecar was lost.
  *
+ * Claims are conservative: an upstream config (e.g. ambient
+ * PLAYWRIGHT_MCP_BROWSER=chromium resolving to channel 'chrome-for-testing')
+ * launches the same binary as our patchright config but WITHOUT the stealth
+ * contextOptions, so the channel alone must not be reported as provider
+ * provenance (issue #28).
+ *
  * @param {any} config
  */
 function inferProviderDetails(config) {
@@ -1197,7 +1203,9 @@ function inferProviderDetails(config) {
   const launchOptions = browser?.launchOptions ?? {};
   const executablePath = typeof launchOptions.executablePath === 'string' ? launchOptions.executablePath.toLowerCase() : '';
   const args = Array.isArray(launchOptions.args) ? launchOptions.args : [];
-  if (launchOptions.channel === 'chrome-for-testing')
+  const hasStealthContext = browser?.contextOptions?.userAgent !== undefined
+    || browser?.contextOptions?.viewport === null;
+  if (launchOptions.channel === 'chrome-for-testing' && hasStealthContext)
     return { name: 'patchright', version: providerVersion('patchright') };
   if (browser?.browserName === 'firefox' && executablePath.includes('camoufox'))
     return { name: 'camoufox', version: providerVersion('camoufox') };

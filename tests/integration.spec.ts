@@ -102,19 +102,29 @@ test('browser provider selection respects explicit config', async ({}) => {
 
   expect(providers.hasExplicitBrowserConfig(['open', '--browser=firefox'], {})).toBe(true);
   expect(providers.hasExplicitBrowserConfig(['open', '--config', 'cli.json'], {})).toBe(true);
-  expect(providers.hasExplicitBrowserConfig(['open'], { PLAYWRIGHT_MCP_BROWSER: 'firefox' })).toBe(true);
+  expect(providers.hasExplicitBrowserConfig(['open'], { PLAYWRIGHT_MCP_CONFIG: 'mcp.json' })).toBe(true);
+  // Ambient upstream env vars are set system-wide for other tools; they must not
+  // silence stealth provider selection (issue #28).
+  expect(providers.hasExplicitBrowserConfig(['open'], { PLAYWRIGHT_MCP_BROWSER: 'firefox' })).toBe(false);
+  expect(providers.hasExplicitBrowserConfig(['open'], { PLAYWRIGHT_MCP_EXECUTABLE_PATH: '/x/chrome' })).toBe(false);
   expect(providers.hasExplicitBrowserConfig(['open'], {})).toBe(false);
-
-  expect(providers.createProviderState('open', ['open'], {}).enabled).toBe(true);
-  expect(providers.createProviderState('open', ['open', '--browser=webkit'], {}).enabled).toBe(false);
-  expect(providers.createProviderState('close', ['close'], {}).enabled).toBe(false);
 });
 
 test('recovers provider identity from browser config when metadata is missing', async ({}) => {
   const { inferProviderDetails } = require('../cliEnhancements');
+  // patchright identity requires the stealth contextOptions, not just the channel
+  expect(inferProviderDetails({
+    browser: {
+      browserName: 'chromium',
+      launchOptions: { channel: 'chrome-for-testing' },
+      contextOptions: { userAgent: 'Mozilla/5.0 Chrome/149.0.0.0' },
+    },
+  })).toEqual({ name: 'patchright', version: '1.61.1' });
+  // An upstream ambient config launches the same binary with NO stealth context;
+  // claiming patchright provenance there would be a lie (issue #28).
   expect(inferProviderDetails({
     browser: { browserName: 'chromium', launchOptions: { channel: 'chrome-for-testing' } },
-  })).toEqual({ name: 'patchright', version: '1.61.1' });
+  })).toBeUndefined();
   expect(inferProviderDetails({
     browser: { browserName: 'firefox', launchOptions: { executablePath: '/cache/camoufox/camoufox-bin' } },
   })).toEqual({ name: 'camoufox', version: '0.10.2' });
@@ -127,6 +137,44 @@ test('recovers provider identity from browser config when metadata is missing', 
   expect(inferProviderDetails({
     browser: { browserName: 'chromium', launchOptions: { channel: 'chrome' } },
   })).toBeUndefined();
+});
+
+test('ambient upstream browser env does not silence stealth provider selection', async ({}) => {
+  const { configureBrowserProviderFallbacks } = require('../browserProviders');
+  // PLAYWRIGHT_MCP_BROWSER is set system-wide for other tools (playwright MCP).
+  // open must still activate the default stealth provider (issue #28).
+  const env: NodeJS.ProcessEnv = {
+    PLAYWRIGHT_MCP_BROWSER: 'chromium',
+    PLAYWRIGHT_MCP_EXECUTABLE_PATH: '/wrong/browser',
+  };
+  class Session {
+    static async startDaemon() {
+      return { pid: 1, sessionName: 'default' };
+    }
+  }
+  const config = await configureBrowserProviderFallbacks({
+    command: 'open',
+    env,
+    sessionModule: { Session },
+  });
+  expect(config.enabled).toBe(true);
+  expect(config.providers).toEqual(['cloakbrowser']);
+  expect(env.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER).toBe('cloakbrowser');
+  expect(env.PLAYWRIGHT_MCP_BROWSER).toBeUndefined();
+  expect(env.PLAYWRIGHT_MCP_EXECUTABLE_PATH).toBeUndefined();
+  // The generated config must carry the stealth UA override, not the ambient one.
+  const configPath = env.PLAYWRIGHT_MCP_CONFIG;
+  expect(configPath).toBeTruthy();
+  const generated = JSON.parse(require('fs').readFileSync(configPath!, 'utf8'));
+  expect(generated.browser.contextOptions.userAgent).toContain('Chrome/');
+  expect(generated.browser.contextOptions.userAgent).not.toContain('Headless');
+});
+
+test('explicit --browser flag still skips provider selection', async ({}) => {
+  const { createProviderState } = require('../browserProviders');
+  expect(createProviderState('open', ['open', '--browser=firefox'], {}).enabled).toBe(false);
+  expect(createProviderState('open', ['open'], { PLAYWRIGHT_MCP_CONFIG: '/tmp/cfg.json' }).enabled).toBe(false);
+  expect(createProviderState('open', ['open'], {}).enabled).toBe(true);
 });
 
 test('reports declared versions when an optional provider package is unavailable', async ({}) => {
@@ -396,13 +444,8 @@ test('reports active provider, re-evaluates it, and lists the provider name', as
     exitCode: 0,
   }));
 
-  const daemonRoot = path.join(test.info().outputPath(), 'daemon');
-  const metadataRelativePath = fs.readdirSync(daemonRoot, { recursive: true })
-      .map(String)
-      .find(file => file.endsWith('provider-report.provider.json'));
-  expect(metadataRelativePath).toBeTruthy();
-  fs.unlinkSync(path.join(daemonRoot, metadataRelativePath!));
-
+  // With the sidecar present, list reports the provider name instead of the
+  // generic browser channel.
   const list = await runCli('list');
   expect(list.output).toContain('browser-type: patchright');
   expect(list.output).not.toContain('browser-type: chrome-for-testing');
@@ -412,8 +455,8 @@ test('reports active provider, re-evaluates it, and lists the provider name', as
     expect.objectContaining({ name: 'provider-report', browserType: 'patchright' }),
   ]));
 
-  const inferredJson = await runCli('-s=provider-report', 'eval', '() => document.title', '--json');
-  expect(JSON.parse(inferredJson.output)).toEqual(expect.objectContaining({
+  const sidecarJson = await runCli('-s=provider-report', 'eval', '() => document.title', '--json');
+  expect(JSON.parse(sidecarJson.output)).toEqual(expect.objectContaining({
     ok: true,
     provider: { name: 'patchright', version: '1.61.1' },
   }));
@@ -425,6 +468,30 @@ test('reports active provider, re-evaluates it, and lists the provider name', as
   }));
 
   await runCli('-s=provider-report', 'close');
+});
+
+test('session without sidecar does not claim patchright provenance from channel alone', async ({}) => {
+  // Upstream session files record only browserName+launchOptions, which look
+  // identical for our patchright config and an ambient upstream chromium
+  // launch. Channel chrome-for-testing alone therefore must NOT claim
+  // patchright provenance (issue #28).
+  const opened = await runCli('-s=channel-only', 'open', 'data:text/html,<title>C</title>', '--json');
+  expect(JSON.parse(opened.output).provider?.name).toBeTruthy();
+
+  const daemonRoot = path.join(test.info().outputPath(), 'daemon');
+  const metadataRelativePath = fs.readdirSync(daemonRoot, { recursive: true })
+      .map(String)
+      .find(file => file.endsWith('channel-only.provider.json'));
+  expect(metadataRelativePath).toBeTruthy();
+  fs.unlinkSync(path.join(daemonRoot, metadataRelativePath!));
+
+  const evalJson = await runCli('-s=channel-only', 'eval', '() => document.title', '--json');
+  const payload = JSON.parse(evalJson.output);
+  expect(payload.ok).toBe(true);
+  // No sidecar + no stealth markers in the session file = no provider claim.
+  expect(payload.provider).toBeNull();
+
+  await runCli('-s=channel-only', 'close');
 });
 
 test('emits stable structured output with page metadata and provider details', async ({}) => {

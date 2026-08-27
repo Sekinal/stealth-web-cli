@@ -289,14 +289,19 @@ stealth-browser-cli delete-data              # delete user data for default sess
 
 By default, this fork opens new sessions with CloakBrowser only. Patchright and Camoufox are opt-in:
 select one with `PLAYWRIGHT_CLI_BROWSER_PROVIDER=patchright` or `camoufox`, or configure an explicit
-fallback order such as `cloakbrowser,patchright,camoufox`. Explicit
-`--browser`, `--config`, `PLAYWRIGHT_MCP_BROWSER`, and `PLAYWRIGHT_MCP_CONFIG`
-settings are respected and skip the automatic provider selection.
+fallback order such as `cloakbrowser,patchright,camoufox`. Explicit invocation-level
+`--browser`, `--config`, and `PLAYWRIGHT_MCP_CONFIG` settings are respected and skip the automatic
+provider selection. Ambient upstream environment variables such as `PLAYWRIGHT_MCP_BROWSER` do not
+skip stealth selection: they are frequently set system-wide for other tools and would otherwise
+silently launch a stock headless Chromium whose user agent leaks `HeadlessChrome` (issue #28).
 
 Every `open` reports the selected provider and installed provider version. Fallback warnings include
 the underlying activation or daemon-launch error. Opening an already-running session restarts it and
 re-evaluates the configured provider order; `list` reports the provider name instead of the generic
-browser channel, including for older sessions whose provider sidecar is missing. Camoufox's browser
+browser channel. When a session's provider sidecar is missing, the name is recovered only when the
+session file still carries identifiable stealth markers (CloakBrowser's `--fingerprint` argument,
+Camoufox's binary path, or the patchright stealth context options); otherwise the generic channel
+is reported. Camoufox's browser
 binary is installed only when Camoufox is explicitly selected; a fresh selection waits for that
 download to finish and uses Playwright's Firefox transport while the other providers retain
 Patchright. Patchright's Chrome for Testing browser can be installed explicitly with

@@ -369,11 +369,20 @@ function firstCommand(argv) {
 }
 
 /**
+ * Decide whether the user explicitly configured a browser for this invocation.
+ * Only real invocation-level intent (--browser, --config, PLAYWRIGHT_MCP_CONFIG)
+ * skips the stealth providers. Ambient upstream environment variables such as
+ * PLAYWRIGHT_MCP_BROWSER are set system-wide for other tools (e.g. playwright
+ * MCP) and previously silenced provider selection entirely, launching a stock
+ * headless Chromium whose UA leaks "HeadlessChrome" (issue #28). When our
+ * providers activate they delete those ambient variables, so honoring them is
+ * no longer needed for correctness.
+ *
  * @param {string[]} argv
  * @param {NodeJS.ProcessEnv} env
  */
 function hasExplicitBrowserConfig(argv, env) {
-  if (env[configEnvName] || env.PLAYWRIGHT_MCP_BROWSER || env.PLAYWRIGHT_MCP_EXECUTABLE_PATH)
+  if (env[configEnvName])
     return true;
   return hasFlag(argv, 'config') || hasFlag(argv, 'browser');
 }
