@@ -690,6 +690,11 @@ test('goto detects captcha widgets in the DOM (turnstile/recaptcha/hcaptcha)', a
   const hcaptcha = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<iframe src="https://hcaptcha.com/captcha/v2/api.js"></iframe>', '--timeout=5', '--json');
   expect(JSON.parse(hcaptcha.output).result.challenge).toEqual({ type: 'hcaptcha', blocked: true });
 
+  // hCaptcha embeds `recaptchacompat=true` in its iframe URL; its own
+  // `recaptcha` substring must not misclassify the widget as reCAPTCHA.
+  const hcaptchaCompat = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<iframe src="https://hcaptcha.com/captcha/v2/api.js?recaptchacompat=true"></iframe>', '--timeout=5', '--json');
+  expect(JSON.parse(hcaptchaCompat.output).result.challenge).toEqual({ type: 'hcaptcha', blocked: true });
+
   const plain = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<p>hello</p>', '--timeout=5', '--json');
   expect(JSON.parse(plain.output).result.challenge).toEqual({ type: 'none', blocked: false });
   await runCli('-s=captcha-widget', 'close');
@@ -801,6 +806,16 @@ test('solve-captcha detects, times out, and injects tokens', async ({}) => {
   expect(injectedPayload.captcha).toBe('turnstile');
   expect(injectedPayload.solved).toBe(true);
   expect(injectedPayload.injected).toBe(true);
+
+  // hCaptcha widget with the `recaptchacompat` flag must be detected as
+  // hCaptcha, not reCAPTCHA, and use the hCaptcha token field.
+  const hcaptchaGoto = await runCli('-s=solve-captcha', 'goto', 'data:text/html,<iframe src="https://hcaptcha.com/captcha/v2/api.js?recaptchacompat=true"></iframe><input name="h-captcha-response" value="">', '--timeout=5', '--json');
+  expect(JSON.parse(hcaptchaGoto.output).result.challenge).toEqual({ type: 'hcaptcha', blocked: true });
+
+  const hcaptchaSol = await runCli('-s=solve-captcha', 'solve-captcha', '--timeout=1', '--json');
+  const hcaptchaPayload = JSON.parse(hcaptchaSol.output).result;
+  expect(hcaptchaPayload.captcha).toBe('hcaptcha');
+  expect(hcaptchaPayload.solved).toBe(false);
 
   await runCli('-s=solve-captcha', 'close');
 });

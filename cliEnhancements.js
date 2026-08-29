@@ -371,8 +371,8 @@ function prepareCommandArgs(args) {
       const has = (sel) => !!document.querySelector(sel);
       return {
         turnstile: has('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-turnstile-widget]'),
-        recaptcha: has('iframe[src*="recaptcha"], .g-recaptcha, [class*="g-recaptcha"], [data-sitekey]'),
-        hcaptcha: has('iframe[src*="hcaptcha.com"], .h-captcha'),
+        recaptcha: has('iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"], .g-recaptcha, [class*="g-recaptcha"]'),
+        hcaptcha: has('iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"], .h-captcha, [data-hcaptcha-widget-id]'),
       };
     }).catch(() => ({ turnstile: false, recaptcha: false, hcaptcha: false }));
     if (dom.turnstile) return { type: 'turnstile', blocked: true };
@@ -585,8 +585,8 @@ function prepareCommandArgs(args) {
     const holdButton = [...document.querySelectorAll('button, [role="button"]')].some(el => /hold|press/i.test(el.textContent || ''));
     return {
       turnstile: q('.cf-turnstile, [data-turnstile-widget], iframe[src*="challenges.cloudflare.com"]'),
-      recaptcha: q('.g-recaptcha, iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]'),
-      hcaptcha: q('.h-captcha, iframe[src*="hcaptcha.com"]'),
+      recaptcha: q('.g-recaptcha, iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"], iframe[title*="reCAPTCHA"]'),
+      hcaptcha: q('.h-captcha, iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"], [data-hcaptcha-widget-id]'),
       hold: holdButton,
     };
   });
@@ -612,7 +612,7 @@ function prepareCommandArgs(args) {
       const el = document.querySelector('[data-sitekey], .cf-turnstile, .g-recaptcha, .h-captcha');
       if (el && el.getAttribute('data-sitekey'))
         return el.getAttribute('data-sitekey');
-      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"]');
+      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"]');
       if (iframe) {
         const m = (iframe.src || '').match(/[?&]k=([^&]+)/);
         if (m) return m[1];
@@ -664,10 +664,14 @@ function prepareCommandArgs(args) {
   }
   if (type === 'recaptcha') {
     try {
-      await page.evaluate(() => {
-        const box = document.querySelector('.recaptcha-checkbox, iframe[title*="reCAPTCHA"]');
-        if (box) box.click();
-      });
+      const frame = page.frameLocator('iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"]').first();
+      await frame.locator('.recaptcha-checkbox, [role="checkbox"]').first().click({ timeout: 3000 });
+    } catch (_) {}
+  }
+  if (type === 'hcaptcha') {
+    try {
+      const frame = page.frameLocator('iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"]').first();
+      await frame.locator('.checkbox, [role="checkbox"], input[type="checkbox"]').first().click({ timeout: 3000 });
     } catch (_) {}
   }
   try {
@@ -786,8 +790,8 @@ async function readPageMetadata(originalRun, session, clientInfo) {
         const has = (sel) => !!document.querySelector(sel);
         const captcha = {
           turnstile: has('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-turnstile-widget]'),
-          recaptcha: has('iframe[src*="recaptcha"], .g-recaptcha, [class*="g-recaptcha"], [data-sitekey]'),
-          hcaptcha: has('iframe[src*="hcaptcha.com"], .h-captcha'),
+          recaptcha: has('iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"], .g-recaptcha, [class*="g-recaptcha"]'),
+          hcaptcha: has('iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"], .h-captcha, [data-hcaptcha-widget-id]'),
         };
         return {
           url: location.href,
