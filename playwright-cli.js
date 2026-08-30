@@ -79,6 +79,18 @@ async function main() {
       }
     }
   }
+  // Scraping (Crawlee + CloakBrowser) runs its own browser instance in the CLI
+  // process, so it bypasses program() and the daemon session entirely.
+  if (command === 'scrape') {
+    const { runScrape } = require('./scraper');
+    try {
+      await runScrape(argv);
+    } catch (error) {
+      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   if (command !== 'install')
     checkInstalledSkills();
   const providerConfig = await configureBrowserProviderFallbacks({ command, sessionModule });

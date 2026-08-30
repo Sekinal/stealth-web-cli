@@ -625,6 +625,70 @@ test('fetch supports basic auth via --user/--password', async ({}) => {
   }
 });
 
+test('scrape renders JS content, retries challenges, crawls, and extracts', async ({}) => {
+  const server = http.createServer((req, res) => {
+    if (req.url.startsWith('/challenge')) {
+      res.writeHead(403, { 'content-type': 'text/html' });
+      res.end('<html><title>Just a moment...</title><body><p>Checking your browser before accessing, please enable JS.</p></body></html>');
+      return;
+    }
+    if (req.url.startsWith('/page2')) {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html><head><title>Page Two</title></head><body><h1>Second</h1><a href="/">Home</a></body></html>');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><head><title>Scrape Home</title></head><body><h1>Welcome</h1><div id="d"></div><a href="/page2">p2</a>' +
+        '<script>document.getElementById("d").innerText = "Rendered by JS";</script></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const page = await runCli('scrape', `${base}/`);
+    expect(page.exitCode, page.output).toBe(0);
+    const record = JSON.parse(page.output);
+    expect(record.title).toBe('Scrape Home');
+    expect(record.status).toBe(200);
+    expect(record.text).toContain('Rendered by JS');
+    expect(record.attempts).toBe(1);
+    expect(record.retried).toBe(false);
+    expect(record.challenge).toEqual({ type: 'none', blocked: false });
+
+    const text = await runCli('scrape', `${base}/`, '--output-format=text');
+    expect(text.output.trim()).toContain('Welcome');
+
+    const schemaFile = path.join(test.info().outputPath(), 'schema.json');
+    fs.writeFileSync(schemaFile, JSON.stringify({ title: { selector: 'h1' } }));
+    const extracted = await runCli('scrape', `${base}/`, `--schema=${schemaFile}`);
+    expect(JSON.parse(extracted.output).extracted).toEqual({ title: 'Welcome' });
+
+    // Challenge pages are retried and surfaced (never captured as content).
+    const challenged = await runCli('scrape', `${base}/challenge`, '--retry=2');
+    const challengePayload = JSON.parse(challenged.output);
+    expect(challengePayload.ok).toBe(false);
+    expect(challengePayload.challenge).toEqual({ type: 'cloudflare', blocked: true });
+    expect(challengePayload.retried).toBe(true);
+    expect(challengePayload.attempts).toBeGreaterThan(1);
+
+    const crawled = await runCli('scrape', `${base}/`, '--crawl', '--max-requests=5');
+    const crawlPayload = JSON.parse(crawled.output);
+    expect(crawlPayload.results.map(r => r.title)).toEqual(expect.arrayContaining(['Scrape Home', 'Page Two']));
+    expect(crawlPayload.failedRequests).toEqual([]);
+
+    const badFormat = await runCli('scrape', `${base}/`, '--output-format=yaml');
+    expect(badFormat.exitCode).not.toBe(0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 test('wait-for waits for a selector or text to appear', async ({}) => {
   await runCli('-s=wait-for-test', 'open', 'data:text/html,<h1>Welcome</h1>');
   const found = await runCli('-s=wait-for-test', 'wait-for', 'text=Welcome', '--timeout=5', '--json');

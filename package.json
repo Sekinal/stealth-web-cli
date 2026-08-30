@@ -1,7 +1,7 @@
 {
   "name": "stealth-browser-cli",
   "version": "0.1.21",
-  "description": "Stealth browser automation CLI on CloakBrowser, with wreq/httpcloak fingerprint-matched HTTP fetch engines",
+  "description": "Stealth browser automation CLI on CloakBrowser, with Crawlee scraping and wreq/httpcloak fingerprint-matched HTTP fetch engines",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Sekinal/stealth-browser-cli.git"
@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "cloakbrowser": "0.5.3",
+    "crawlee": "^3.18.1",
     "httpcloak": "^1.6.11",
     "patchright-core": "1.61.1",
     "playwright": "1.61.1",

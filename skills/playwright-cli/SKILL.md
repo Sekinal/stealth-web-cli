@@ -166,6 +166,25 @@ playwright-cli fetch <url> [opts]    # raw body on stdout, composes with jq
 opening a browser. Auto mode tries `wreq` first and escalates to the CloakBrowser session only when a
 challenge is detected; challenge-heavy or JS-rendered pages require an open session.
 
+### Scraping
+
+```bash
+playwright-cli scrape <url> [opts]   # render a page through CloakBrowser (Crawlee)
+  --crawl                            follow same-origin links (rate-limited, deduped)
+  --max-requests=<N>                 max pages (default 1, or 20 with --crawl)
+  --max-depth=<N>                    max link depth with --crawl
+  --same-origin=true|false           only follow same-hostname links (default true)
+  --concurrency=<N>                  parallel pages (default 1)
+  --select=<css>                     extract elements matching a selector
+  --schema=<json-file>               extract fields: { field: { selector, attr?, all? } }
+  --output-format=json|text|markdown|csv
+  --output=<file>                    write output to a file
+  --timeout=<seconds> / --retry=<N>  per-page timeout and retries (default 60 / 3)
+```
+
+Results report `attempts`/`retried`; challenge pages are retried and surfaced as `challenge` rather
+than captured as content.
+
 ### DevTools
 
 ```bash

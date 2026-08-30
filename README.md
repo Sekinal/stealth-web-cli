@@ -267,6 +267,29 @@ Chrome/Edge/Firefox presets) — for static targets, so no browser session is ne
 ...) is detected; challenge-heavy or JS-rendered pages therefore require an open session. `eval` and
 `tab-*` stay browser-only.
 
+### Scraping
+
+```bash
+stealth-browser-cli scrape <url> [opts]    # render a page and emit structured output
+  --crawl                                   follow same-origin links
+  --max-requests=<N>                        max pages (default 1, or 20 with --crawl)
+  --max-depth=<N>                           max link depth to follow with --crawl
+  --same-origin=true|false                  only follow same-hostname links (default true)
+  --concurrency=<N>                         parallel pages (default 1)
+  --select=<css>                            extract elements matching a selector
+  --schema=<json-file>                      extract fields: { field: { selector, attr?, all? } }
+  --output-format=json|text|markdown|csv    output format (default json)
+  --output=<file>                           write output to a file
+  --timeout=<seconds>                       per-page request timeout (default 60)
+  --retry=<N>                               retries with exponential backoff on 5xx/empty/challenge (default 3)
+```
+
+`scrape` renders pages through the CloakBrowser provider via [Crawlee](https://crawlee.dev), giving
+retry-aware, rate-limited crawling with request deduplication. Each result reports `attempts` and
+`retried`; challenge pages (403/429 or Cloudflare/recaptcha markers) are retried and surfaced as
+`challenge` instead of being captured as content. Use `--select`/`--schema` for field extraction
+without `eval` gymnastics, then pipe `--output-format=csv` into your data pipeline.
+
 ### DevTools
 
 ```bash

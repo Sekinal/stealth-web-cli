@@ -124,6 +124,30 @@ function extendHelp(help) {
       ].join('\n'),
     };
   }
+  if (!help.commands.scrape) {
+    help.commands.scrape = {
+      flags: {
+        crawl: 'boolean', 'max-requests': 'string', 'max-depth': 'string', 'same-origin': 'boolean',
+        concurrency: 'string', select: 'string', schema: 'string', 'output-format': 'string',
+        output: 'string', timeout: 'string', retry: 'string',
+      },
+      args: ['url'],
+      help: [
+        'playwright-cli scrape <url>               scrape rendered content on stdout or --output=<file>',
+        '  --crawl                                 crawl the site following same-origin links',
+        '  --max-requests=<N>                      max pages (default 1, or 20 with --crawl)',
+        '  --max-depth=<N>                         max link depth to follow with --crawl',
+        '  --same-origin=true|false                only follow same-hostname links (default true)',
+        '  --concurrency=<N>                       parallel pages (default 1)',
+        '  --select=<css>                          extract elements matching a selector',
+        '  --schema=<json-file>                    extract fields: { field: { selector, attr?, all? } }',
+        '  --output-format=json|text|markdown|csv  output format (default json)',
+        '  --output=<file>                         write output to a file instead of stdout',
+        '  --timeout=<seconds>                     per-page request timeout (default 60)',
+        '  --retry=<N>                             retries with exponential backoff on 5xx/empty/challenge (default 3)',
+      ].join('\n'),
+    };
+  }
 }
 
 /**
