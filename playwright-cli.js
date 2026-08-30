@@ -51,6 +51,34 @@ async function main() {
     runCleanup(argv);
     return;
   }
+  // Plain-HTTP fetch engines (wreq/httpcloak) run directly in the CLI process,
+  // before the daemon: the cli-client requires an open browser session for any
+  // command, which these engines must not need. Auto mode escalates to the
+  // browser by forcing --engine=browser for the program() pass.
+  if (command === 'fetch') {
+    const { parsePlainFetchPlan, runPlainFetchEngine, printPlainFetchResult } = require('./fetchEngines');
+    const plan = parsePlainFetchPlan(argv);
+    if (plan) {
+      try {
+        const outcome = await runPlainFetchEngine(plan.options);
+        if (outcome.escalate) {
+          process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH = '1';
+        } else {
+          printPlainFetchResult(outcome.result, { json: plan.json });
+          return;
+        }
+      } catch (error) {
+        if (plan.json) {
+          const { failurePayload } = require('./cliEnhancements');
+          process.stdout.write(JSON.stringify(failurePayload(error, undefined, [], null, undefined), null, 2) + '\n');
+        } else {
+          process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+        }
+        process.exitCode = 1;
+        return;
+      }
+    }
+  }
   if (command !== 'install')
     checkInstalledSkills();
   const providerConfig = await configureBrowserProviderFallbacks({ command, sessionModule });

@@ -248,6 +248,25 @@ stealth-browser-cli route-list               # list active routes
 stealth-browser-cli unroute [pattern]        # remove route(s)
 ```
 
+### HTTP requests
+
+```bash
+stealth-browser-cli fetch <url> [opts]       # raw body on stdout, composes with jq
+  --method=GET|POST|PUT|PATCH|DELETE|HEAD      HTTP method (default GET)
+  --data=<body>                                request body
+  --header="Key: Value"                        request header (comma-separated)
+  --timeout=<seconds>                          request timeout
+  --retry=<N>                                  retry up to N times on 5xx/network errors
+  --engine=auto|wreq|httpcloak|browser         engine (default auto)
+```
+
+`fetch` uses fingerprint-matched plain-HTTP engines — `wreq` (TLS JA3/JA4 + HTTP2 through
+[wreq-js](https://www.npmjs.com/package/wreq-js), the rquest successor) and `httpcloak` (managed
+Chrome/Edge/Firefox presets) — for static targets, so no browser session is needed. Auto mode tries
+`wreq` first and escalates to the CloakBrowser session only when a challenge (Cloudflare, reCAPTCHA,
+...) is detected; challenge-heavy or JS-rendered pages therefore require an open session. `eval` and
+`tab-*` stay browser-only.
+
 ### DevTools
 
 ```bash

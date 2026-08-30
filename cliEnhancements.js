@@ -87,7 +87,7 @@ function extendHelp(help) {
   }
   if (!help.commands.fetch) {
     help.commands.fetch = {
-      flags: { method: 'string', data: 'string', header: 'string', timeout: 'string', user: 'string', password: 'string', retry: 'string' },
+      flags: { method: 'string', data: 'string', header: 'string', timeout: 'string', user: 'string', password: 'string', retry: 'string', engine: 'string' },
       args: ['url'],
       raw: true,
       help: [
@@ -98,6 +98,7 @@ function extendHelp(help) {
         '  --user=<name> --password=<secret>        basic authentication',
         '  --timeout=<seconds>                      request timeout (default: no timeout)',
         '  --retry=<N>                              retry up to N times on 5xx/network errors',
+        '  --engine=wreq|httpcloak|browser|auto     fetch engine (default auto: wreq first, then browser on challenge)',
       ].join('\n'),
     };
   }
@@ -455,6 +456,15 @@ function prepareCommandArgs(args) {
     const method = (prepared.method ?? 'GET').toUpperCase();
     if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(method))
       throw new Error(`Unsupported fetch method '${prepared.method}'. Expected one of: GET, POST, PUT, PATCH, DELETE, HEAD.`);
+    // Plain engines (wreq/httpcloak) are executed directly in the CLI process
+    // (playwright-cli.js) to avoid opening a browser. When auto escalation falls
+    // back to the browser, that path re-enters here with this env flag forcing
+    // the browser engine.
+    const engine = (process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH === '1' ? 'browser' : (prepared.engine ?? 'auto')).toLowerCase();
+    delete prepared.engine;
+    delete process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH;
+    if (!['wreq', 'httpcloak', 'browser', 'auto'].includes(engine))
+      throw new Error(`Unsupported fetch engine '${engine}'. Expected one of: wreq, httpcloak, browser, auto.`);
     const data = prepared.data;
     const headerArg = prepared.header;
     const timeoutMs = prepared.timeout !== undefined ? parseTimeoutMs(prepared.timeout) : undefined;
@@ -1361,12 +1371,14 @@ function firstCommand(argv) {
 
 module.exports = {
   configureCliEnhancements,
+  detectChallengeFromText,
   failurePayload,
   inferProviderDetails,
   normalizeUpstreamResult,
   parseConsoleText,
   parseTimeoutMs,
   prepareCommandArgs,
+  proxyDetails,
   resolveEvalOutputPath,
   runCleanup,
   successPayload,

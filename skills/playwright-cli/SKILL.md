@@ -150,6 +150,22 @@ playwright-cli unroute "**/*.jpg"
 playwright-cli unroute
 ```
 
+### HTTP requests
+
+```bash
+playwright-cli fetch <url> [opts]    # raw body on stdout, composes with jq
+  --method=GET|POST|PUT|PATCH|DELETE|HEAD   HTTP method (default GET)
+  --data=<body>                             request body
+  --header="Key: Value"                     request header (comma-separated)
+  --timeout=<seconds>                       request timeout
+  --retry=<N>                               retry up to N times on 5xx/network errors
+  --engine=auto|wreq|httpcloak|browser      engine (default auto)
+```
+
+`fetch` runs through fingerprint-matched plain-HTTP engines (`wreq` via wreq-js, `httpcloak`) without
+opening a browser. Auto mode tries `wreq` first and escalates to the CloakBrowser session only when a
+challenge is detected; challenge-heavy or JS-rendered pages require an open session.
+
 ### DevTools
 
 ```bash

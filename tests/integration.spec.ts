@@ -512,6 +512,65 @@ test('fetch detects anti-bot challenge types from status and body', async ({}) =
   }
 });
 
+test('fetch plain-HTTP engines run without opening a browser', async ({}) => {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/challenge') {
+      res.writeHead(403, { 'content-type': 'text/html' });
+      res.end('<html><title>Just a moment...</title><p>Checking your browser before accessing</p></html>');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ hello: 'world' }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    for (const engine of ['wreq', 'httpcloak']) {
+      const result = await runCli('fetch', `${base}/`, `--engine=${engine}`, '--json');
+      expect(result.exitCode, result.output).toBe(0);
+      const payload = JSON.parse(result.output);
+      expect(payload.ok).toBe(true);
+      expect(payload.provider).toBeNull();
+      expect(payload.result.status).toBe(200);
+      expect(payload.result.json).toEqual({ hello: 'world' });
+    }
+
+    // Raw body on stdout without --json composes with jq, no browser needed.
+    const body = await runCli('fetch', `${base}/`);
+    expect(JSON.parse(body.output.trim())).toEqual({ hello: 'world' });
+
+    // Explicit engine surfaces the challenge inside result without escalating.
+    const explicit = await runCli('fetch', `${base}/challenge`, '--engine=wreq', '--json');
+    const explicitPayload = JSON.parse(explicit.output);
+    expect(explicitPayload.ok).toBe(false);
+    expect(explicitPayload.result.failed).toBe(true);
+    expect(explicitPayload.result.challenge).toEqual({ type: 'cloudflare', blocked: true });
+
+    // Auto mode escalates to the browser (CloakBrowser) when a challenge is
+    // detected, so a session must be open for that path.
+    await runCli('-s=auto-fetch', 'open', 'data:text/html,<title>Auto</title>');
+    const auto = await runCli('-s=auto-fetch', 'fetch', `${base}/challenge`, '--json');
+    const autoPayload = JSON.parse(auto.output);
+    expect(autoPayload.provider?.name).toBe('cloakbrowser');
+    expect(autoPayload.result.status).toBe(403);
+    expect(autoPayload.result.challenge).toEqual({ type: 'cloudflare', blocked: true });
+    await runCli('-s=auto-fetch', 'close');
+
+    // Unknown engines are rejected by the standard validation path.
+    const bad = await runCli('fetch', `${base}/`, '--engine=bogus', '--json');
+    expect(bad.exitCode).not.toBe(0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 test('goto detects captcha widgets in the DOM (turnstile/recaptcha/hcaptcha)', async ({}) => {
   await runCli('-s=captcha-widget', 'open', 'data:text/html,<title>s</title>');
 
