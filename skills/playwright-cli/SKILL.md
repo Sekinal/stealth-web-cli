@@ -201,17 +201,15 @@ playwright-cli --raw localstorage-get theme
 For deterministic agent output, pass `--json`. Page commands return
 `{ ok, url, title, result, console, provider }`; provider-managed sessions report the active provider
 and version, while explicitly configured sessions use `null`. Failures preserve the same shape, add
-`error`, and exit nonzero. Provider fallback adds
-`fallback: { requested, active, reason }` and persists it for later session commands. Session listing
+`error`, and exit nonzero. Session listing
 and JSON output recover the provider from browser configuration if older sidecar metadata is absent.
 `eval --output=<file>` writes raw string values without JSON escaping and returns an absolute result
 path; use `--filename=<file>` for upstream JSON serialization.
 
-The default provider is CloakBrowser only. Patchright and Camoufox are opt-in through
-`PLAYWRIGHT_CLI_BROWSER_PROVIDER` (or an explicit comma-separated fallback order). Install
-Patchright's browser explicitly with `playwright-cli install-browser chrome-for-testing`; Camoufox's
-first explicitly selected open waits for its browser download. An explicit provider selection
-overrides upstream browser environment variables for that launch.
+CloakBrowser is the sole browser provider and is selected by default. The `patchright` and
+`camoufox` providers were removed; selecting them via `PLAYWRIGHT_CLI_BROWSER_PROVIDER` errors
+with a clear message. An explicit provider selection overrides upstream browser environment
+variables for that launch.
 
 ```bash
 playwright-cli list --json

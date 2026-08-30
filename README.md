@@ -287,40 +287,28 @@ stealth-browser-cli close                    # close the browser
 stealth-browser-cli delete-data              # delete user data for default session
 ```
 
-By default, this fork opens new sessions with CloakBrowser only. Patchright and Camoufox are opt-in:
-select one with `PLAYWRIGHT_CLI_BROWSER_PROVIDER=patchright` or `camoufox`, or configure an explicit
-fallback order such as `cloakbrowser,patchright,camoufox`. Explicit
+CloakBrowser is the sole browser provider. It is selected by default; set
+`PLAYWRIGHT_CLI_BROWSER_PROVIDER=cloakbrowser` explicitly (or omit it) for the same result. The
+removed `patchright` and `camoufox` providers are rejected with a clear error. Explicit
 `--browser`, `--config`, `PLAYWRIGHT_MCP_BROWSER`, and `PLAYWRIGHT_MCP_CONFIG`
 settings are respected and skip the automatic provider selection.
 
-Every `open` reports the selected provider and installed provider version. Fallback warnings include
-the underlying activation or daemon-launch error. Opening an already-running session restarts it and
-re-evaluates the configured provider order; `list` reports the provider name instead of the generic
-browser channel, including for older sessions whose provider sidecar is missing. Camoufox's browser
-binary is installed only when Camoufox is explicitly selected; a fresh selection waits for that
-download to finish and uses Playwright's Firefox transport while the other providers retain
-Patchright. Patchright's Chrome for Testing browser can be installed explicitly with
-`stealth-browser-cli install-browser chrome-for-testing`. An explicit
-`PLAYWRIGHT_CLI_BROWSER_PROVIDER` takes precedence over conflicting upstream browser environment
-variables.
+Every `open` reports the selected provider and installed provider version. Opening an already-running
+session restarts it and re-evaluates the configured provider; `list` reports the provider name instead
+of the generic browser channel, including for older sessions whose provider sidecar is missing. An
+explicit `PLAYWRIGHT_CLI_BROWSER_PROVIDER` takes precedence over conflicting upstream browser
+environment variables.
 
 ### Structured output
 
 Pass `--json` to any command for a deterministic response. Page commands return `ok`, `url`, `title`,
 `result`, `console`, and `provider`. `provider` contains the active provider and version for managed
 sessions and is `null` when provider selection was bypassed. Failures use the same schema, include an
-`error`, and exit nonzero. When provider selection falls back, responses also contain a persisted
-`fallback` object with `requested`, `active`, and the underlying `reason`, so later commands retain
-the same provenance.
+`error`, and exit nonzero.
 
 ```json
 {
-  "provider": { "name": "patchright", "version": "1.61.1" },
-  "fallback": {
-    "requested": "cloakbrowser",
-    "active": "patchright",
-    "reason": "cloakbrowser: executable not found"
-  }
+  "provider": { "name": "cloakbrowser", "version": "0.5.3" }
 }
 ```
 

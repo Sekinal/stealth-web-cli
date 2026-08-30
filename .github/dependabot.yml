@@ -19,7 +19,6 @@ updates:
       browser-providers:
         patterns:
           - "cloakbrowser"
-          - "camoufox-js"
     commit-message:
       prefix: deps
 

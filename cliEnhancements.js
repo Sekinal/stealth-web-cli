@@ -1201,10 +1201,6 @@ function inferProviderDetails(config) {
   const launchOptions = browser?.launchOptions ?? {};
   const executablePath = typeof launchOptions.executablePath === 'string' ? launchOptions.executablePath.toLowerCase() : '';
   const args = Array.isArray(launchOptions.args) ? launchOptions.args : [];
-  if (launchOptions.channel === 'chrome-for-testing')
-    return { name: 'patchright', version: providerVersion('patchright') };
-  if (browser?.browserName === 'firefox' && executablePath.includes('camoufox'))
-    return { name: 'camoufox', version: providerVersion('camoufox') };
   if (executablePath.includes('cloakbrowser') || args.some(arg => typeof arg === 'string' && arg.startsWith('--fingerprint=')))
     return { name: 'cloakbrowser', version: providerVersion('cloakbrowser') };
   return undefined;
