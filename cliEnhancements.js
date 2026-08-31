@@ -124,6 +124,31 @@ function extendHelp(help) {
       ].join('\n'),
     };
   }
+  if (!help.commands.scrape) {
+    help.commands.scrape = {
+      flags: {
+        crawl: 'boolean', 'max-requests': 'string', 'max-depth': 'string', 'same-origin': 'boolean',
+        concurrency: 'string', 'requests-per-minute': 'string', select: 'string', schema: 'string',
+        'output-format': 'string', output: 'string', timeout: 'string', retry: 'string',
+      },
+      args: ['url'],
+      help: [
+        'playwright-cli scrape <url>               scrape rendered content on stdout or --output=<file>',
+        '  --crawl                                 crawl the site following same-origin links',
+        '  --max-requests=<N>                      max pages (default 1, or 20 with --crawl)',
+        '  --max-depth=<N>                         max link depth to follow with --crawl',
+        '  --same-origin=true|false                only follow same-hostname links (default true)',
+        '  --concurrency=<N>                       parallel pages (default 1)',
+        '  --requests-per-minute=<N>               rate-limit requests per minute (default: none)',
+        '  --select=<css>                          extract elements matching a selector',
+        '  --schema=<json-file>                    extract fields: { field: { selector, attr?, all? } }',
+        '  --output-format=json|text|markdown|csv  output format (default json)',
+        '  --output=<file>                         write output to a file instead of stdout',
+        '  --timeout=<seconds>                     per-page request timeout (default 60)',
+        '  --retry=<N>                             retries with backoff on 5xx/empty/challenge (default 3)',
+      ].join('\n'),
+    };
+  }
 }
 
 /**
@@ -398,8 +423,8 @@ function prepareCommandArgs(args) {
       const has = (sel) => !!document.querySelector(sel);
       return {
         turnstile: has('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-turnstile-widget]'),
-        recaptcha: has('iframe[src*="recaptcha"], .g-recaptcha, [class*="g-recaptcha"], [data-sitekey]'),
-        hcaptcha: has('iframe[src*="hcaptcha.com"], .h-captcha'),
+        recaptcha: has('iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"], .g-recaptcha, [class*="g-recaptcha"]'),
+        hcaptcha: has('iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"], .h-captcha, [data-hcaptcha-widget-id]'),
       };
     }).catch(() => ({ turnstile: false, recaptcha: false, hcaptcha: false }));
     if (dom.turnstile) return { type: 'turnstile', blocked: true };
@@ -484,7 +509,10 @@ function prepareCommandArgs(args) {
       throw new Error(`Unsupported fetch method '${prepared.method}'. Expected one of: GET, POST, PUT, PATCH, DELETE, HEAD.`);
     const engineRaw = typeof prepared.engine === 'string' ? prepared.engine.toLowerCase() : '';
     const engine = engineRaw === undefined || engineRaw === '' ? 'wreq' : engineRaw;
-    if (!['wreq', 'httpcloak', 'browser'].includes(engine))
+    // Plain engines (node-wreq/httpcloak) have no data:/about:/blob: transport;
+    // the browser run-code handles those schemes natively.
+    const resolvedEngine = /^(data|about|blob):/i.test(url) ? 'browser' : engine;
+    if (!['wreq', 'httpcloak', 'browser'].includes(resolvedEngine))
       throw new Error(`Unsupported --engine '${prepared.engine}'. Expected one of: wreq, httpcloak, browser.`);
     const data = prepared.data;
     const headerArg = prepared.header;
@@ -513,10 +541,10 @@ function prepareCommandArgs(args) {
 
     // Non-browser engines run in Node before the daemon is ever contacted;
     // stash the request spec for the run-wrapper to dispatch.
-    if (engine !== 'browser') {
+    if (resolvedEngine !== 'browser') {
       prepared._ = ['engine-fetch'];
       prepared._engineRequest = {
-        engine,
+        engine: resolvedEngine,
         url,
         method,
         data,
@@ -636,8 +664,8 @@ function prepareCommandArgs(args) {
     const holdButton = [...document.querySelectorAll('button, [role="button"]')].some(el => /hold|press/i.test(el.textContent || ''));
     return {
       turnstile: q('.cf-turnstile, [data-turnstile-widget], iframe[src*="challenges.cloudflare.com"]'),
-      recaptcha: q('.g-recaptcha, iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]'),
-      hcaptcha: q('.h-captcha, iframe[src*="hcaptcha.com"]'),
+      recaptcha: q('.g-recaptcha, iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"], iframe[title*="reCAPTCHA"]'),
+      hcaptcha: q('.h-captcha, iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"], [data-hcaptcha-widget-id]'),
       hold: holdButton,
     };
   });
@@ -663,7 +691,7 @@ function prepareCommandArgs(args) {
       const el = document.querySelector('[data-sitekey], .cf-turnstile, .g-recaptcha, .h-captcha');
       if (el && el.getAttribute('data-sitekey'))
         return el.getAttribute('data-sitekey');
-      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"]');
+      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"]');
       if (iframe) {
         const m = (iframe.src || '').match(/[?&]k=([^&]+)/);
         if (m) return m[1];
@@ -715,10 +743,14 @@ function prepareCommandArgs(args) {
   }
   if (type === 'recaptcha') {
     try {
-      await page.evaluate(() => {
-        const box = document.querySelector('.recaptcha-checkbox, iframe[title*="reCAPTCHA"]');
-        if (box) box.click();
-      });
+      const frame = page.frameLocator('iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"]').first();
+      await frame.locator('.recaptcha-checkbox, [role="checkbox"]').first().click({ timeout: 3000 });
+    } catch {}
+  }
+  if (type === 'hcaptcha') {
+    try {
+      const frame = page.frameLocator('iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"]').first();
+      await frame.locator('.checkbox, [role="checkbox"], input[type="checkbox"]').first().click({ timeout: 3000 });
     } catch {}
   }
   try {
@@ -840,8 +872,8 @@ async function readPageMetadata(originalRun, session, clientInfo) {
         const has = (sel) => !!document.querySelector(sel);
         const captcha = {
           turnstile: has('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-turnstile-widget]'),
-          recaptcha: has('iframe[src*="recaptcha"], .g-recaptcha, [class*="g-recaptcha"], [data-sitekey]'),
-          hcaptcha: has('iframe[src*="hcaptcha.com"], .h-captcha'),
+          recaptcha: has('iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"], .g-recaptcha, [class*="g-recaptcha"]'),
+          hcaptcha: has('iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"], .h-captcha, [data-hcaptcha-widget-id]'),
         };
         return {
           url: location.href,
@@ -1296,6 +1328,14 @@ async function emitEngineFetchResult(engineRequest, session, options, runOptions
     process.exitCode = 1;
     return { isError: true, text: JSON.stringify(payload, null, 2) };
   }
+  // Surface challenge classification exactly like the browser path: a blocked
+  // response is never presented as ordinary content.
+  const engineChallenge = detectChallengeFromText(
+      null,
+      typeof engineResult.body === 'string' ? engineResult.body : '',
+      typeof engineResult.status === 'number' ? engineResult.status : null);
+  if (engineChallenge.blocked)
+    engineResult.challenge = engineChallenge;
   if (!runOptions?.json) {
     if (engineResult.failed)
       process.exitCode = 1;
@@ -1324,20 +1364,30 @@ async function runEngineFetchFromArgv(argv, env) {
   const command = argv.find(arg => !arg.startsWith('-'));
   if (command !== 'fetch')
     return false;
-  const prepared = prepareCommandArgs({ _: argv.filter(arg => !arg.startsWith('-') || arg.startsWith('--')) });
+  // Build the args object the way upstream's parser would so --method=/
+  // --data=/--user=/--retry= etc. reach prepareCommandArgs as top-level keys
+  // instead of being stranded inside the positional array.
+  const positional = [];
+  const flags = /** @type {Record<string, string | boolean>} */ ({});
+  for (const arg of argv) {
+    if (arg.startsWith('-s=') || arg === 'fetch')
+      continue;
+    if (arg.startsWith('--')) {
+      const eq = arg.indexOf('=');
+      const key = eq === -1 ? arg.slice(2) : arg.slice(2, eq);
+      flags[key] = eq === -1 ? true : arg.slice(eq + 1);
+    } else if (arg.startsWith('-')) {
+      // Other tool-level flags (e.g. global output switches) are irrelevant here.
+      continue;
+    } else {
+      positional.push(arg);
+    }
+  }
+  const prepared = prepareCommandArgs({ _: ['fetch', ...positional], ...flags });
   if (prepared._?.[0] !== 'engine-fetch' || !prepared._engineRequest)
     return false;
-  // The upstream parser drops unknown flags, so --engine= never reaches
-  // prepared.engine when passed on the command line. Extract it from argv.
-  const engineFlag = argv.find(arg => arg.startsWith('--engine='));
-  if (engineFlag) {
-    const requested = engineFlag.slice('--engine='.length).toLowerCase();
-    if (!['wreq', 'httpcloak', 'browser'].includes(requested))
-      throw new Error(`Unsupported --engine '${engineFlag.slice(9)}'. Expected one of: wreq, httpcloak, browser.`);
-    if (requested === 'browser')
-      return false; // needs a live session; let the daemon path handle it
-    prepared._engineRequest.engine = requested;
-  }
+  if (prepared._engineRequest.engine === 'browser')
+    return false; // needs a live session; let the daemon path handle it
 
   const outputMode = { json: argv.includes('--json'), raw: argv.includes('--raw') };
   const result = await emitEngineFetchResult(prepared._engineRequest, undefined, { env }, outputMode);
@@ -1546,11 +1596,10 @@ function fallbackDetailsForSession(session, env) {
  * Recovers provider identity for sessions created before sidecar metadata was
  * written, or when a sidecar was lost.
  *
- * Claims are conservative: an upstream config (e.g. ambient
- * PLAYWRIGHT_MCP_BROWSER=chromium resolving to channel 'chrome-for-testing')
- * launches the same binary as our patchright config but WITHOUT the stealth
- * contextOptions, so the channel alone must not be reported as provider
- * provenance (issue #28).
+ * CloakBrowser is the sole provider, so claims are conservative and
+ * evidence-based: only a CloakBrowser binary path or `--fingerprint` launch
+ * arg proves provenance. An ambient upstream chromium config (issue #28)
+ * carries neither, so it reports no provider.
  *
  * @param {any} config
  */
@@ -1559,12 +1608,6 @@ function inferProviderDetails(config) {
   const launchOptions = browser?.launchOptions ?? {};
   const executablePath = typeof launchOptions.executablePath === 'string' ? launchOptions.executablePath.toLowerCase() : '';
   const args = /** @type {unknown[]} */ (Array.isArray(launchOptions.args) ? launchOptions.args : []);
-  const hasStealthContext = browser?.contextOptions?.userAgent !== undefined
-    || browser?.contextOptions?.viewport === null;
-  if (launchOptions.channel === 'chrome-for-testing' && hasStealthContext)
-    return { name: 'patchright', version: providerVersion('patchright') };
-  if (browser?.browserName === 'firefox' && executablePath.includes('camoufox'))
-    return { name: 'camoufox', version: providerVersion('camoufox') };
   if (executablePath.includes('cloakbrowser') || args.some(arg => typeof arg === 'string' && arg.startsWith('--fingerprint=')))
     return { name: 'cloakbrowser', version: providerVersion('cloakbrowser') };
   return undefined;
@@ -1729,6 +1772,7 @@ function firstCommand(argv) {
 
 module.exports = {
   configureCliEnhancements,
+  detectChallengeFromText,
   failurePayload,
   inferProviderDetails,
   normalizeUpstreamResult,

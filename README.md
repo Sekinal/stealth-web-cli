@@ -248,6 +248,47 @@ stealth-web-cli route-list               # list active routes
 stealth-web-cli unroute [pattern]        # remove route(s)
 ```
 
+### HTTP requests
+
+```bash
+stealth-web-cli fetch <url> [opts]       # raw body on stdout, composes with jq
+  --method=GET|POST|PUT|PATCH|DELETE|HEAD   HTTP method (default GET)
+  --data=<body>                             request body
+  --header="Key: Value"                     request header (comma-separated)
+  --timeout=<seconds> / --retry=<N>         timeout and retries on 5xx/network
+  --engine=wreq|httpcloak|browser           transport engine (default wreq)
+```
+
+`fetch` runs through fingerprint-matched plain-HTTP engines — `node-wreq` (TLS JA3/JA4 + HTTP2, the
+[wreq](https://wreq.org) successor to rquest) and `httpcloak` (managed Chrome/Edge/Firefox presets) —
+so no browser session is needed for static targets. The default `wreq` engine escalates to the
+CloakBrowser session automatically when a challenge is detected; challenge-heavy or JS-rendered pages
+therefore require an open session (`open`). `--engine=browser` rides CloakBrowser's own network
+stack. `eval` and `tab-*` stay browser-only.
+
+### Scraping
+
+```bash
+stealth-web-cli scrape <url> [opts]     # render a page (or crawl) and emit structured output
+  --crawl                                 follow same-origin links
+  --max-requests=<N>                      max pages (default 1, or 20 with --crawl)
+  --max-depth=<N>                         max link depth with --crawl
+  --same-origin=true|false                only follow same-hostname links (default true)
+  --concurrency=<N> / --requests-per-minute=<N>  parallel pages / rate limit
+  --select=<css>                          extract elements matching a selector
+  --schema=<json-file>                    extract fields: { field: { selector, attr?, all? } }
+  --output-format=json|text|markdown|csv  output format (default json)
+  --output=<file>                         write output to a file
+  --timeout=<seconds> / --retry=<N>       per-page timeout and retries (default 60 / 3)
+```
+
+`scrape` renders pages through the CloakBrowser provider via [Crawlee](https://crawlee.dev), giving
+retry-aware, rate-limited crawling with request deduplication. Each result reports `attempts` and
+`retried`; challenge pages (403/429 or Cloudflare/reCAPTCHA markers) are retried (and auto-solved via
+`CAPSOLVER_API_KEY` when present), then surfaced as `challenge` with content redacted and a nonzero
+exit — never captured as content. Use `--select`/`--schema` for field extraction, then pipe
+`--output-format=csv` into your data pipeline.
+
 ### DevTools
 
 ```bash
@@ -287,25 +328,19 @@ stealth-web-cli close                    # close the browser
 stealth-web-cli delete-data              # delete user data for default session
 ```
 
-By default, this fork opens new sessions with CloakBrowser only. Patchright and Camoufox are opt-in:
-select one with `PLAYWRIGHT_CLI_BROWSER_PROVIDER=patchright` or `camoufox`, or configure an explicit
-fallback order such as `cloakbrowser,patchright,camoufox`. Explicit invocation-level
+CloakBrowser is the sole browser provider; it is selected by default (set
+`PLAYWRIGHT_CLI_BROWSER_PROVIDER=cloakbrowser`, or omit it, for the same result). The `patchright`
+and `camoufox` providers were removed and are rejected with a clear error. Explicit invocation-level
 `--browser`, `--config`, and `PLAYWRIGHT_MCP_CONFIG` settings are respected and skip the automatic
 provider selection. Ambient upstream environment variables such as `PLAYWRIGHT_MCP_BROWSER` do not
 skip stealth selection: they are frequently set system-wide for other tools and would otherwise
 silently launch a stock headless Chromium whose user agent leaks `HeadlessChrome` (issue #28).
 
-Every `open` reports the selected provider and installed provider version. Fallback warnings include
-the underlying activation or daemon-launch error. Opening an already-running session restarts it and
-re-evaluates the configured provider order; `list` reports the provider name instead of the generic
-browser channel. When a session's provider sidecar is missing, the name is recovered only when the
-session file still carries identifiable stealth markers (CloakBrowser's `--fingerprint` argument,
-Camoufox's binary path, or the patchright stealth context options); otherwise the generic channel
-is reported. Camoufox's browser
-binary is installed only when Camoufox is explicitly selected; a fresh selection waits for that
-download to finish and uses Playwright's Firefox transport while the other providers retain
-Patchright. Patchright's Chrome for Testing browser can be installed explicitly with
-`stealth-web-cli install-browser chrome-for-testing`. An explicit
+Every `open` reports the selected provider and installed provider version. Opening an already-running
+session restarts it and re-evaluates the configured provider; `list` reports the provider name
+instead of the generic browser channel. When a session's provider sidecar is missing, the name is
+recovered only when the session file still carries a CloakBrowser stealth marker (`--fingerprint`
+argument or its binary path); otherwise the generic channel is reported. An explicit
 `PLAYWRIGHT_CLI_BROWSER_PROVIDER` takes precedence over conflicting upstream browser environment
 variables.
 
@@ -314,18 +349,11 @@ variables.
 Pass `--json` to any command for a deterministic response. Page commands return `ok`, `url`, `title`,
 `result`, `console`, and `provider`. `provider` contains the active provider and version for managed
 sessions and is `null` when provider selection was bypassed. Failures use the same schema, include an
-`error`, and exit nonzero. When provider selection falls back, responses also contain a persisted
-`fallback` object with `requested`, `active`, and the underlying `reason`, so later commands retain
-the same provenance.
+`error`, and exit nonzero.
 
 ```json
 {
-  "provider": { "name": "patchright", "version": "1.61.1" },
-  "fallback": {
-    "requested": "cloakbrowser",
-    "active": "patchright",
-    "reason": "cloakbrowser: executable not found"
-  }
+  "provider": { "name": "cloakbrowser", "version": "0.5.3" }
 }
 ```
 

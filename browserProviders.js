@@ -15,8 +15,10 @@ const activeProviderEnvName = 'PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER';
 const fallbackEnvName = 'PLAYWRIGHT_CLI_BROWSER_PROVIDER_FALLBACK';
 const configEnvName = 'PLAYWRIGHT_MCP_CONFIG';
 
+// CloakBrowser is the sole browser provider. Patchright and Camoufox were
+// removed; PLAYWRIGHT_CLI_BROWSER_PROVIDER only accepts 'cloakbrowser' now.
 const defaultProviderOrder = ['cloakbrowser'];
-const validProviders = new Set([...defaultProviderOrder, 'patchright', 'camoufox']);
+const validProviders = new Set(defaultProviderOrder);
 
 /**
  * @param {{
@@ -54,8 +56,7 @@ async function configureBrowserProviderFallbacks(options) {
     while (providerIndex < state.providers.length) {
       const provider = state.providers[providerIndex];
       try {
-        const startDaemon = /** @type {(this: any, ...args: any[]) => any} */ (provider === 'camoufox' ? camoufoxStartDaemon(undefined, env) : originalStartDaemon);
-        return await startDaemon.apply(this, args);
+        return await originalStartDaemon.apply(this, args);
       } catch (error) {
         lastError = error;
         const existingFallback = readProviderFallback(env);
@@ -95,39 +96,6 @@ async function configureBrowserProviderFallbacks(options) {
   taggedDaemon.__browserProviderFallbacks = true;
 
   return { enabled: true, providers: state.providers };
-}
-
-/**
- * @param {{ sessionModule?: any, registryModule?: any } | undefined} modules
- * @param {NodeJS.ProcessEnv} env
- * @returns {(clientInfo: any, cliArgs: any, mode?: any) => Promise<any>}
- */
-function camoufoxStartDaemon(modules, env = process.env) {
-  let { sessionModule, registryModule } = modules ?? {};
-  if (!sessionModule || !registryModule) {
-    const playwrightRoot = path.dirname(require.resolve('playwright-core/package.json'));
-    sessionModule = require(path.join(playwrightRoot, 'lib/tools/cli-client/session.js'));
-    registryModule = require(path.join(playwrightRoot, 'lib/tools/cli-client/registry.js'));
-  }
-  return async function(clientInfo, cliArgs, mode) {
-    const result = await sessionModule.Session.startDaemon(clientInfo, cliArgs, mode);
-    const daemonClientInfo = registryModule.createClientInfo();
-    if (daemonClientInfo.daemonProfilesDir !== clientInfo.daemonProfilesDir) {
-      const source = path.join(daemonClientInfo.daemonProfilesDir, `${result.sessionName}.session`);
-      const destination = path.join(clientInfo.daemonProfilesDir, `${result.sessionName}.session`);
-      fs.copyFileSync(source, destination);
-    }
-    const fallback = readProviderFallback(env);
-    try {
-      fs.writeFileSync(path.join(daemonClientInfo.daemonProfilesDir, `${result.sessionName}.provider.json`), JSON.stringify({
-        provider: 'camoufox',
-        version: providerVersion('camoufox'),
-        ...(fallback ? { fallback } : {}),
-      }));
-    } catch {
-    }
-    return result;
-  };
 }
 
 /**
@@ -202,6 +170,8 @@ function resolveProviderOrder(providerOverride) {
     return defaultProviderOrder;
   const providers = providerOverride.split(',').map(provider => provider.trim()).filter(Boolean);
   for (const provider of providers) {
+    if (provider === 'patchright' || provider === 'camoufox')
+      throw new Error(`Browser provider '${provider}' was removed. CloakBrowser is the sole browser provider.`);
     if (!validProviders.has(provider))
       throw new Error(`Unsupported ${providerEnvName}: ${provider}. Expected one of ${[...validProviders].join(', ')}.`);
   }
@@ -295,20 +265,6 @@ async function configPathForProvider(state, provider) {
  */
 async function configForProvider(provider, state) {
   const launchArgs = dnsLaunchArgs(state);
-  if (provider === 'patchright') {
-    const version = getChromeMajorVersion();
-    return {
-      browser: {
-        browserName: 'chromium',
-        launchOptions: {
-          channel: 'chrome-for-testing',
-          ...(launchArgs.length ? { args: launchArgs } : {}),
-        },
-        contextOptions: { userAgent: chromeUserAgent(version) },
-      },
-    };
-  }
-
   if (provider === 'cloakbrowser') {
     const { buildLaunchOptions, CHROMIUM_VERSION } = await import('cloakbrowser');
     const majorVersion = CHROMIUM_VERSION.split('.')[0];
@@ -324,59 +280,8 @@ async function configForProvider(provider, state) {
       },
     };
   }
-  if (provider === 'camoufox') {
-    await ensureCamoufoxInstalled();
-    const { launchOptions } = await import('camoufox-js');
-    return {
-      browser: {
-        browserName: 'firefox',
-        launchOptions: await camoufoxLaunchOptions(launchOptions),
-        // Camoufox rejects Playwright's newer `isMobile` viewport field.
-        // Let Camoufox's fingerprint configuration own the viewport instead.
-        contextOptions: { viewport: null },
-      },
-    };
-  }
 
   throw new Error(`Provider '${provider}' does not use a generated config.`);
-}
-/**
- * @param {Function} launchOptions
- */
-async function camoufoxLaunchOptions(launchOptions) {
-  try {
-    return await launchOptions({ headless: true, env: {} });
-  } catch (error) {
-    const message = formatProviderError(error);
-    if (!/better_sqlite3\.node|Could not locate the bindings file/i.test(message))
-      throw error;
-    return await launchOptions({
-      headless: true,
-      env: {},
-      block_webgl: true,
-      i_know_what_im_doing: true,
-    });
-  }
-}
-
-/**
- * camoufox-js 0.10.x starts its automatic browser download without awaiting
- * it. Await the package's installer ourselves so the first `open` cannot race
- * a partially extracted browser.
- *
- * @param {{ camoufoxPath: Function, CamoufoxFetcher: new () => { install: Function }} | undefined} [pkgman]
- */
-async function ensureCamoufoxInstalled(pkgman) {
-  pkgman ??= await import('camoufox-js/dist/pkgman.js');
-  try {
-    pkgman.camoufoxPath(false);
-    return false;
-  } catch {
-    const fetcher = new pkgman.CamoufoxFetcher();
-    await fetcher.install();
-    pkgman.camoufoxPath(false);
-    return true;
-  }
 }
 
 /**
@@ -452,28 +357,11 @@ function chromeUserAgent(majorVersion) {
 }
 
 /**
- * Extract the Chrome major version from the installed Chrome for Testing binary.
- * @returns {string}
- */
-function getChromeMajorVersion() {
-  try {
-    const { chromium } = require('playwright-core');
-    const exe = chromium.executablePath();
-    const { execFileSync } = require('child_process');
-    const output = execFileSync(exe, ['--version'], { encoding: 'utf8', timeout: 5000 });
-    const match = output.match(/Chrome(?: for Testing)?\/(\d+)\./);
-    if (match)
-      return match[1];
-  } catch {}
-  return '149';
-}
-
-/**
  * Build Chromium launch args for DNS override flags. `--host-resolver-rules`
  * pins hostname→IP resolution (e.g. `MAP example.com 1.2.3.4`). There is no
  * stable Chromium flag for custom DNS servers; `--dns-servers` is accepted for
  * API compatibility but maps to `--host-resolver-rules` with an explicit
- * MAP rule. Firefox-based providers (Camoufox) ignore these Chromium-only flags.
+ * MAP rule.
  *
  * @param {ReturnType<typeof createProviderState> | undefined} state
  * @returns {string[]}
@@ -488,12 +376,11 @@ function dnsLaunchArgs(state) {
  * @param {(packageName: string) => string} [installedVersion]
  */
 function providerVersion(provider, installedVersion = installedProviderVersion) {
-  const packageName = provider === 'patchright' ? 'patchright-core' : provider === 'camoufox' ? 'camoufox-js' : provider;
   try {
-    return installedVersion(packageName);
+    return installedVersion(provider);
   } catch {
     const packageJson = /** @type {{ dependencies?: Record<string, string>, optionalDependencies?: Record<string, string> }} */ (require('./package.json'));
-    const version = packageJson.dependencies?.[packageName] ?? packageJson.optionalDependencies?.[packageName];
+    const version = packageJson.dependencies?.[provider] ?? packageJson.optionalDependencies?.[provider];
     if (!version)
       throw new Error(`Unable to determine the installed or declared version of browser provider '${provider}'.`);
     return version;
@@ -509,13 +396,11 @@ function installedProviderVersion(packageName) {
 
 module.exports = {
   configureBrowserProviderFallbacks,
-  camoufoxStartDaemon,
-  camoufoxLaunchOptions,
+  chromeUserAgent,
   createProviderState,
   resolveProviderOrder,
   hasExplicitBrowserConfig,
   formatProviderError,
-  ensureCamoufoxInstalled,
   providerVersion,
   readProviderFallback,
 };

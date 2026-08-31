@@ -120,7 +120,7 @@ module.exports = tseslint.config(
     // Upstream-derived code: best-effort sidecar writes and JSON probes
     // deliberately swallow errors with empty catch blocks, and the
     // activateProvider wrapper relies on sequential await reassignments.
-    files: ['cliEnhancements.js', 'browserProviders.js'],
+    files: ['cliEnhancements.js', 'browserProviders.js', 'scraper.js'],
     rules: {
       'no-empty': ['error', { allowEmptyCatch: true }],
       'require-atomic-updates': 'off',
@@ -134,6 +134,19 @@ module.exports = tseslint.config(
     files: ['cliEnhancements.js', 'browserProviders.js'],
     rules: {
       'jsdoc/check-param-names': 'off',
+    },
+  },
+  {
+    // scraper.js ships real callbacks into Playwright's page.evaluate, so the
+    // browser globals those functions reference are in scope there.
+    files: ['scraper.js'],
+    languageOptions: {
+      globals: {
+        document: 'readonly',
+        Event: 'readonly',
+        window: 'readonly',
+        navigator: 'readonly',
+      },
     },
   },
   prettierConfig,

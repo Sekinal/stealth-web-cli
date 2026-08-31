@@ -18,8 +18,10 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests',
-  fullyParallel: true,
+  // CloakBrowser's free binary allows a single concurrent session, so provider
+  // spawns must be serialized.
+  fullyParallel: false,
   forbidOnly: !!process.env.CI,
-  workers: process.env.CI ? 2 : undefined,
+  workers: 1,
   reporter: 'list',
 });

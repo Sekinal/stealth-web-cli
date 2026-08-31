@@ -58,6 +58,17 @@ async function main() {
   const { runEngineFetchFromArgv } = require('./cliEnhancements');
   if (await runEngineFetchFromArgv(argv, process.env))
     return;
+  // Scraping (Crawlee + CloakBrowser) also runs its own browser in this process.
+  if (command === 'scrape') {
+    try {
+      const { runScrape } = require('./scraper');
+      await runScrape(argv);
+    } catch (error) {
+      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   const providerConfig = await configureBrowserProviderFallbacks({ command, sessionModule });
   configureCliEnhancements({ argv, command, providerConfig, sessionModule, outputModule, help });
   await notifyAboutUpdate(command).catch(() => {});

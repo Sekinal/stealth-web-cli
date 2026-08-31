@@ -11,6 +11,6 @@
     "strict": false,
     "noImplicitAny": false
   },
-  "include": ["cliEnhancements.js", "browserProviders.js"],
+  "include": ["cliEnhancements.js", "browserProviders.js", "scraper.js"],
   "exclude": ["node_modules", "test-results", "scripts", "playwright-cli.js", "skillCheck.js"]
 }
