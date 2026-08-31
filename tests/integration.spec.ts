@@ -623,6 +623,9 @@ test('goto detects captcha widgets in the DOM (turnstile/recaptcha/hcaptcha)', a
 });
 
 test('scrape renders JS content, crawls with ok, redacts challenges, and extracts', async ({}) => {
+  // Each scrape spawns a CloakBrowser instance; Windows CI is slow enough that
+  // the default 30s budget is too tight for the full sequence.
+  test.setTimeout(120_000);
   const server = http.createServer((req, res) => {
     if (req.url.startsWith('/challenge')) {
       res.writeHead(403, { 'content-type': 'text/html' });
