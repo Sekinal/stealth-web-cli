@@ -19,7 +19,11 @@ updates:
       browser-providers:
         patterns:
           - "cloakbrowser"
-          - "camoufox-js"
+      fetch-and-scrape:
+        patterns:
+          - "crawlee"
+          - "httpcloak"
+          - "node-wreq"
     commit-message:
       prefix: deps
 

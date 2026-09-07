@@ -8,12 +8,11 @@ to discover from the code alone.
 
 `stealth-web-cli` (package name `stealth-web-cli`, binary `stealth-web-cli`,
 `playwright-cli` alias) is a stealth web-automation CLI layered on top of a
-patched Playwright ("patchright-core") with swappable browser providers:
+patched Playwright ("patchright-core", used purely as the CLI/session transport):
 
-- **cloakbrowser** — default. Fingerprint-randomizing Chromium build.
-- **patchright** — opt-in (`PLAYWRIGHT_CLI_BROWSER_PROVIDER=patchright`).
-  Reuses Chrome for Testing; adds stealth `contextOptions` (UA override).
-- **camoufox** — opt-in Firefox with anti-fingerprinting.
+- **cloakbrowser** — the only browser provider. Fingerprint-randomizing Chromium
+  build. The removed `patchright` and `camoufox` providers are rejected with a
+  clear "was removed" error.
 
 `playwright-cli.js` (bin) → `browserProviders.js` (provider selection/config
 generation) → `cliEnhancements.js` (CLI UX: goto/fetch interception, JSON
@@ -74,8 +73,8 @@ Never disable a failing test instead of fixing it.
   provider is active; `contextOptions.userAgent` in generated configs is the
   guarantee.
 - Provenance claims require evidence: `inferProviderDetails` may only claim
-  `patchright` with stealth contextOptions present, `cloakbrowser` with a
-  `--fingerprint` arg or its binary path, `camoufox` with its binary path.
+  `cloakbrowser` with a `--fingerprint` arg or its binary path; nothing else
+  is a provider.
 - The `package identity` integration test locks name/bin/URLs — renaming
   anything requires updating that test deliberately.
 

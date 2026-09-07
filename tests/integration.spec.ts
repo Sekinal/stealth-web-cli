@@ -40,7 +40,7 @@ async function runCliWithOptions(options: { env?: NodeJS.ProcessEnv, cwd?: strin
     const childProcess = spawn(process.execPath, [cliPath, ...args], {
       env: {
         ...process.env,
-        PLAYWRIGHT_CLI_BROWSER_PROVIDER: process.env.PLAYWRIGHT_CLI_BROWSER_PROVIDER || 'patchright',
+        PLAYWRIGHT_CLI_BROWSER_PROVIDER: process.env.PLAYWRIGHT_CLI_BROWSER_PROVIDER || 'cloakbrowser',
         PLAYWRIGHT_CLI_INSTALLATION_FOR_TEST: test.info().outputPath(),
         PWTEST_DAEMON_SESSION_DIR: path.join(test.info().outputPath(), 'daemon'),
         NO_UPDATE_NOTIFIER: '1',
@@ -98,7 +98,10 @@ test('browser provider selection respects explicit config', async ({}) => {
   const providers = require('../browserProviders');
 
   expect(providers.resolveProviderOrder(undefined)).toEqual(['cloakbrowser']);
-  expect(providers.resolveProviderOrder('camoufox,patchright')).toEqual(['camoufox', 'patchright']);
+  expect(providers.resolveProviderOrder('cloakbrowser')).toEqual(['cloakbrowser']);
+  expect(() => providers.resolveProviderOrder('patchright')).toThrow(/removed/);
+  expect(() => providers.resolveProviderOrder('camoufox')).toThrow(/removed/);
+  expect(() => providers.resolveProviderOrder('cloakbrowser,patchright')).toThrow(/removed/);
 
   expect(providers.hasExplicitBrowserConfig(['open', '--browser=firefox'], {})).toBe(true);
   expect(providers.hasExplicitBrowserConfig(['open', '--config', 'cli.json'], {})).toBe(true);
@@ -112,22 +115,18 @@ test('browser provider selection respects explicit config', async ({}) => {
 
 test('recovers provider identity from browser config when metadata is missing', async ({}) => {
   const { inferProviderDetails } = require('../cliEnhancements');
-  // patchright identity requires the stealth contextOptions, not just the channel
+  // Chrome for Testing launches no longer indicate any stealth provider;
+  // provenance requires a cloakbrowser fingerprint/binary signature.
   expect(inferProviderDetails({
     browser: {
       browserName: 'chromium',
       launchOptions: { channel: 'chrome-for-testing' },
       contextOptions: { userAgent: 'Mozilla/5.0 Chrome/149.0.0.0' },
     },
-  })).toEqual({ name: 'patchright', version: '1.61.1' });
-  // An upstream ambient config launches the same binary with NO stealth context;
-  // claiming patchright provenance there would be a lie (issue #28).
+  })).toBeUndefined();
   expect(inferProviderDetails({
     browser: { browserName: 'chromium', launchOptions: { channel: 'chrome-for-testing' } },
   })).toBeUndefined();
-  expect(inferProviderDetails({
-    browser: { browserName: 'firefox', launchOptions: { executablePath: '/cache/camoufox/camoufox-bin' } },
-  })).toEqual({ name: 'camoufox', version: '0.10.2' });
   expect(inferProviderDetails({
     browser: { browserName: 'chromium', launchOptions: { executablePath: '/cache/.cloakbrowser/chrome' } },
   })).toEqual({ name: 'cloakbrowser', version: '0.5.3' });
@@ -179,9 +178,9 @@ test('explicit --browser flag still skips provider selection', async ({}) => {
 
 test('reports declared versions when an optional provider package is unavailable', async ({}) => {
   const { providerVersion } = require('../browserProviders');
-  expect(providerVersion('camoufox', () => {
+  expect(providerVersion('cloakbrowser', () => {
     throw new Error('optional package is not installed');
-  })).toBe('0.10.2');
+  })).toBe('0.5.3');
 });
 
 test('package identity is stealth-web-cli with both bin entries', async ({}) => {
@@ -205,94 +204,6 @@ test('package identity is stealth-web-cli with both bin entries', async ({}) => 
   expect(skillCheck).not.toContain('stealth-browser-cli');
 });
 
-test('waits for a missing Camoufox browser installation before continuing', async ({}) => {
-  const { ensureCamoufoxInstalled } = require('../browserProviders');
-  let installed = false;
-  let installCompleted = false;
-
-  class CamoufoxFetcher {
-    async install() {
-      await new Promise(resolve => setTimeout(resolve, 10));
-      installed = true;
-      installCompleted = true;
-    }
-  }
-
-  const downloaded = await ensureCamoufoxInstalled({
-    camoufoxPath: () => {
-      if (!installed)
-        throw new Error('Camoufox executable not found');
-      return '/cached/camoufox';
-    },
-    CamoufoxFetcher,
-  });
-  expect(downloaded).toBe(true);
-  expect(installCompleted).toBe(true);
-
-  expect(await ensureCamoufoxInstalled({
-    camoufoxPath: () => '/cached/camoufox',
-    CamoufoxFetcher,
-  })).toBe(false);
-});
-
-test('Camoufox daemon adapter exposes the Playwright session to the CLI registry', async ({}) => {
-  const { camoufoxStartDaemon } = require('../browserProviders');
-  const daemonDir = path.join(test.info().outputPath(), 'cli-daemon');
-  const playwrightDaemonDir = path.join(test.info().outputPath(), 'playwright-daemon');
-  fs.mkdirSync(daemonDir, { recursive: true });
-  fs.mkdirSync(playwrightDaemonDir, { recursive: true });
-
-  const fallback = {
-    requested: 'cloakbrowser',
-    active: 'camoufox',
-    reason: 'cloakbrowser: missing; patchright: failed',
-  };
-  const startDaemon = camoufoxStartDaemon({
-    sessionModule: {
-      Session: {
-        startDaemon: async () => {
-          fs.writeFileSync(path.join(playwrightDaemonDir, 'camoufox.session'), '{"name":"camoufox"}');
-          return { pid: 42, sessionName: 'camoufox' };
-        },
-      },
-    },
-    registryModule: {
-      createClientInfo: () => ({ daemonProfilesDir: playwrightDaemonDir }),
-    },
-  }, { PLAYWRIGHT_CLI_BROWSER_PROVIDER_FALLBACK: JSON.stringify(fallback) });
-
-  expect(await startDaemon({ daemonProfilesDir: daemonDir }, {}, 'open')).toEqual({
-    pid: 42,
-    sessionName: 'camoufox',
-  });
-  expect(fs.readFileSync(path.join(daemonDir, 'camoufox.session'), 'utf8')).toBe('{"name":"camoufox"}');
-  expect(JSON.parse(fs.readFileSync(path.join(playwrightDaemonDir, 'camoufox.provider.json'), 'utf8'))).toEqual({
-    provider: 'camoufox',
-    version: '0.10.2',
-    fallback,
-  });
-});
-
-test('Camoufox disables WebGL sampling when its optional SQLite binding is unavailable', async ({}) => {
-  const { camoufoxLaunchOptions } = require('../browserProviders');
-  const calls: unknown[] = [];
-  const options = await camoufoxLaunchOptions(async (value: unknown) => {
-    calls.push(value);
-    if (calls.length === 1)
-      throw new Error('Could not locate the bindings file: better_sqlite3.node');
-    return { executablePath: '/cached/camoufox', ...value as object };
-  });
-
-  expect(calls).toEqual([
-    { headless: true, env: {} },
-    { headless: true, env: {}, block_webgl: true, i_know_what_im_doing: true },
-  ]);
-  expect(options).toEqual(expect.objectContaining({
-    executablePath: '/cached/camoufox',
-    block_webgl: true,
-  }));
-});
-
 test('does not warn when installed skill only differs in line endings', async ({}) => {
   expect(await runCli('install', '--skills')).toEqual(expect.objectContaining({
     exitCode: 0,
@@ -306,68 +217,30 @@ test('does not warn when installed skill only differs in line endings', async ({
   }));
 });
 
-test('provider fallbacks include activation and launch failure reasons', async ({}) => {
+test('a single CloakBrowser provider surfaces activation and launch failures', async ({}) => {
   const { configureBrowserProviderFallbacks, readProviderFallback } = require('../browserProviders');
 
   const activationEnv: NodeJS.ProcessEnv = {
-    PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser,patchright',
+    PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser',
   };
   let activationError = '';
-  class ActivationSession {
-    static async startDaemon() {
-      return { pid: 1, sessionName: 'default' };
-    }
-  }
-  await configureBrowserProviderFallbacks({
+  await expect(configureBrowserProviderFallbacks({
     command: 'open',
     env: activationEnv,
-    sessionModule: { Session: ActivationSession },
-    stderr: { write: (value: string) => activationError += value },
-    activateProvider: async (_state: unknown, provider: string, env: NodeJS.ProcessEnv) => {
-      if (provider === 'cloakbrowser')
-        throw new Error('Cloak executable was not found');
-      env.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER = provider;
-    },
-  });
-  expect(activationError).toContain("'cloakbrowser' is unavailable (Cloak executable was not found)");
-  expect(activationEnv.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER).toBe('patchright');
-  expect(readProviderFallback(activationEnv)).toEqual({
-    requested: 'cloakbrowser',
-    active: 'patchright',
-    reason: 'cloakbrowser: Cloak executable was not found',
-  });
-
-  const multiActivationEnv: NodeJS.ProcessEnv = {
-    PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser,patchright,camoufox',
-  };
-  await configureBrowserProviderFallbacks({
-    command: 'open',
-    env: multiActivationEnv,
     sessionModule: { Session: class { static async startDaemon() {} } },
-    stderr: { write: () => {} },
-    activateProvider: async (_state: unknown, provider: string, env: NodeJS.ProcessEnv) => {
-      if (provider === 'cloakbrowser')
-        throw new Error('Cloak is missing');
-      if (provider === 'patchright')
-        throw new Error('Patchright cannot launch');
-      env.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER = provider;
+    stderr: { write: (value: string) => activationError += value },
+    activateProvider: async () => {
+      throw new Error('Cloak executable was not found');
     },
-  });
-  expect(readProviderFallback(multiActivationEnv)).toEqual({
-    requested: 'cloakbrowser',
-    active: 'camoufox',
-    reason: 'cloakbrowser: Cloak is missing; patchright: Patchright cannot launch',
-  });
+  })).rejects.toThrow('Cloak executable was not found');
+  expect(activationError).toBe('');
+  expect(readProviderFallback(activationEnv)).toBeUndefined();
 
-  const launchEnv: NodeJS.ProcessEnv = {
-    PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser,patchright',
-  };
+  const launchEnv: NodeJS.ProcessEnv = {};
   let launchError = '';
   class LaunchSession {
     static async startDaemon() {
-      if (launchEnv.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER === 'cloakbrowser')
-        throw new Error('Daemon crashed during launch');
-      return { pid: 2, sessionName: 'default' };
+      throw new Error('Daemon crashed during launch');
     }
   }
   await configureBrowserProviderFallbacks({
@@ -375,24 +248,16 @@ test('provider fallbacks include activation and launch failure reasons', async (
     env: launchEnv,
     sessionModule: { Session: LaunchSession },
     stderr: { write: (value: string) => launchError += value },
-    activateProvider: async (_state: unknown, provider: string, env: NodeJS.ProcessEnv) => {
-      env.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER = provider;
-    },
   });
-  await LaunchSession.startDaemon();
-  expect(launchError).toContain("'cloakbrowser' failed (Daemon crashed during launch)");
-  expect(launchEnv.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER).toBe('patchright');
-  expect(readProviderFallback(launchEnv)).toEqual({
-    requested: 'cloakbrowser',
-    active: 'patchright',
-    reason: 'cloakbrowser: Daemon crashed during launch',
-  });
+  await expect(LaunchSession.startDaemon()).rejects.toThrow('Daemon crashed during launch');
+  expect(launchError).toBe('');
+  expect(readProviderFallback(launchEnv)).toBeUndefined();
 });
 
 test('an explicit provider override replaces conflicting upstream browser environment', async ({}) => {
   const { configureBrowserProviderFallbacks } = require('../browserProviders');
   const env: NodeJS.ProcessEnv = {
-    PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'patchright',
+    PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser',
     PLAYWRIGHT_MCP_BROWSER: 'chromium',
     PLAYWRIGHT_MCP_EXECUTABLE_PATH: '/wrong/browser',
   };
@@ -409,93 +274,84 @@ test('an explicit provider override replaces conflicting upstream browser enviro
   });
   expect(env.PLAYWRIGHT_MCP_BROWSER).toBeUndefined();
   expect(env.PLAYWRIGHT_MCP_EXECUTABLE_PATH).toBeUndefined();
-  expect(env.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER).toBe('patchright');
+  expect(env.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER).toBe('cloakbrowser');
 });
 
-test('structured output reports and persists provider fallback provenance', async ({}) => {
+test('open fails when CloakBrowser is unavailable', async ({}) => {
   const missingCloak = path.join(test.info().outputPath(), 'missing-cloak');
   const opened = await runCliWithOptions({
     env: {
-      PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser,patchright',
       CLOAKBROWSER_BINARY_PATH: missingCloak,
     },
   }, '-s=fallback-json', 'open', 'data:text/html,<title>Fallback</title>', '--json');
-  expect(opened.exitCode).toBe(0);
-  expect(opened.error).toContain("falling back to 'patchright'");
+  expect(opened.exitCode).not.toBe(0);
   expect(JSON.parse(opened.output)).toEqual(expect.objectContaining({
-    ok: true,
-    provider: { name: 'patchright', version: '1.61.1' },
-    fallback: {
-      requested: 'cloakbrowser',
-      active: 'patchright',
-      reason: expect.stringContaining(missingCloak),
-    },
-  }));
-
-  const evaluated = await runCli('-s=fallback-json', 'eval', '() => document.title', '--json');
-  expect(JSON.parse(evaluated.output)).toEqual(expect.objectContaining({
-    ok: true,
-    provider: { name: 'patchright', version: '1.61.1' },
-    fallback: {
-      requested: 'cloakbrowser',
-      active: 'patchright',
-      reason: expect.stringContaining(missingCloak),
-    },
-  }));
-
-  const failed = await runCli('-s=fallback-json', 'eval', '() => { throw new Error("expected failure") }', '--json');
-  expect(failed.exitCode).toBe(1);
-  expect(JSON.parse(failed.output)).toEqual(expect.objectContaining({
     ok: false,
-    provider: { name: 'patchright', version: '1.61.1' },
-    fallback: {
-      requested: 'cloakbrowser',
-      active: 'patchright',
-      reason: expect.stringContaining(missingCloak),
-    },
-    error: expect.stringContaining('expected failure'),
+    error: expect.any(String),
   }));
-  await runCli('-s=fallback-json', 'close');
+});
+
+test('a default-path .playwright/cli.config.json does not silently disable CloakBrowser (issue 37)', async ({}) => {
+  const cwd = test.info().outputPath();
+  fs.mkdirSync(path.join(cwd, '.playwright'), { recursive: true });
+  // The documented proxy setup lives at the default config path; before the
+  // fix it was promoted to a CLI-level override that shadowed the generated
+  // provider config, falling back to a vanilla Chrome channel.
+  fs.writeFileSync(
+      path.join(cwd, '.playwright', 'cli.config.json'),
+      JSON.stringify({ browser: { launchOptions: { proxy: { server: 'http://user:pass@127.0.0.1:1' } } } }),
+  );
+
+  try {
+    const opened = await runCliWithOptions({ cwd }, '-s=default-config-proxy', 'open', 'data:text/html,<title>P37</title>', '--json');
+    expect(opened.exitCode, opened.error).toBe(0);
+    expect(JSON.parse(opened.output)).toEqual(expect.objectContaining({
+      ok: true,
+      provider: { name: 'cloakbrowser', version: '0.5.3' },
+    }));
+  } finally {
+    await runCliWithOptions({ cwd }, '-s=default-config-proxy', 'close');
+  }
 });
 
 test('reports active provider, re-evaluates it, and lists the provider name', async ({}) => {
   const firstOpen = await runCli('-s=provider-report', 'open', 'data:text/html,<title>First</title>');
   expect(firstOpen).toEqual(expect.objectContaining({
-    output: expect.stringContaining('### Browser provider\n- name: patchright\n- version: 1.61.1'),
+    output: expect.stringContaining('### Browser provider\n- name: cloakbrowser\n- version: 0.5.3'),
     exitCode: 0,
   }));
 
   // With the sidecar present, list reports the provider name instead of the
   // generic browser channel.
   const list = await runCli('list');
-  expect(list.output).toContain('browser-type: patchright');
+  expect(list.output).toContain('browser-type: cloakbrowser');
   expect(list.output).not.toContain('browser-type: chrome-for-testing');
 
   const listJson = JSON.parse((await runCli('list', '--json')).output);
   expect(listJson.result.browsers).toEqual(expect.arrayContaining([
-    expect.objectContaining({ name: 'provider-report', browserType: 'patchright' }),
+    expect.objectContaining({ name: 'provider-report', browserType: 'cloakbrowser' }),
   ]));
 
   const sidecarJson = await runCli('-s=provider-report', 'eval', '() => document.title', '--json');
   expect(JSON.parse(sidecarJson.output)).toEqual(expect.objectContaining({
     ok: true,
-    provider: { name: 'patchright', version: '1.61.1' },
+    provider: { name: 'cloakbrowser', version: '0.5.3' },
   }));
 
   const secondOpen = await runCli('-s=provider-report', 'open', 'data:text/html,<title>Second</title>');
   expect(secondOpen).toEqual(expect.objectContaining({
-    error: expect.stringContaining("restarting it to re-evaluate provider order (patchright)"),
+    error: expect.stringContaining("restarting it to re-evaluate provider order (cloakbrowser)"),
     exitCode: 0,
   }));
 
   await runCli('-s=provider-report', 'close');
 });
 
-test('session without sidecar does not claim patchright provenance from channel alone', async ({}) => {
+test('session without sidecar does not claim provider provenance from channel alone', async ({}) => {
   // Upstream session files record only browserName+launchOptions, which look
-  // identical for our patchright config and an ambient upstream chromium
-  // launch. Channel chrome-for-testing alone therefore must NOT claim
-  // patchright provenance (issue #28).
+  // identical for an ambient upstream chromium launch. Channel
+  // chrome-for-testing alone must not claim stealth provider provenance
+  // (issue #28); only a cloakbrowser signature may.
   const opened = await runCli('-s=channel-only', 'open', 'data:text/html,<title>C</title>', '--json');
   expect(JSON.parse(opened.output).provider?.name).toBeTruthy();
 
@@ -509,8 +365,9 @@ test('session without sidecar does not claim patchright provenance from channel 
   const evalJson = await runCli('-s=channel-only', 'eval', '() => document.title', '--json');
   const payload = JSON.parse(evalJson.output);
   expect(payload.ok).toBe(true);
-  // No sidecar + no stealth markers in the session file = no provider claim.
-  expect(payload.provider).toBeNull();
+  // No sidecar, but the generated CloakBrowser config embeds its binary path /
+  // fingerprint args, so provenance is recovered from that evidence.
+  expect(payload.provider).toEqual({ name: 'cloakbrowser', version: '0.5.3' });
 
   await runCli('-s=channel-only', 'close');
 });
@@ -522,7 +379,7 @@ test('emits stable structured output with page metadata and provider details', a
     ok: true,
     title: 'Structured',
     console: [],
-    provider: { name: 'patchright', version: '1.61.1' },
+    provider: { name: 'cloakbrowser', version: '0.5.3' },
     session: 'json-output',
   }));
   expect(openJson.url).toContain('data:text/html');
@@ -534,7 +391,7 @@ test('emits stable structured output with page metadata and provider details', a
     title: 'Structured',
     result: { answer: 42, text: 'Hello' },
     console: [],
-    provider: { name: 'patchright', version: '1.61.1' },
+    provider: { name: 'cloakbrowser', version: '0.5.3' },
     challenge: { type: 'none', blocked: false },
     bodyLength: 5,
     emptyBody: false,
@@ -564,7 +421,7 @@ test('writes complete eval results with --output', async ({}) => {
   expect(JSON.parse(evaluated.output)).toEqual(expect.objectContaining({
     ok: true,
     result: `- [Evaluation result](${outputFile})`,
-    provider: { name: 'patchright', version: '1.61.1' },
+    provider: { name: 'cloakbrowser', version: '0.5.3' },
   }));
   expect(fs.readFileSync(outputFile, 'utf8')).toBe(expected);
 
@@ -751,13 +608,13 @@ test('fetch detects anti-bot challenge types from status and body', async ({}) =
     await runCli('-s=fetch-challenge-test', 'open', 'data:text/html,<title>CH</title>');
     const base = `http://127.0.0.1:${address.port}`;
 
-    const datadome = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/datadome`, '--json');
+    const datadome = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/datadome`, '--engine=wreq', '--json');
     expect(JSON.parse(datadome.output).result.challenge).toEqual({ type: 'datadome', blocked: true });
 
-    const akamai = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/akamai`, '--json');
+    const akamai = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/akamai`, '--engine=wreq', '--json');
     expect(JSON.parse(akamai.output).result.challenge).toEqual({ type: 'blocked', blocked: true });
 
-    const plain = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/plain`, '--json');
+    const plain = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/plain`, '--engine=wreq', '--json');
     expect(JSON.parse(plain.output).result.challenge).toEqual({ type: '403', blocked: true });
     await runCli('-s=fetch-challenge-test', 'close');
   } finally {
@@ -778,11 +635,125 @@ test('goto detects captcha widgets in the DOM (turnstile/recaptcha/hcaptcha)', a
   const hcaptcha = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<iframe src="https://hcaptcha.com/captcha/v2/api.js"></iframe>', '--timeout=5', '--json');
   expect(JSON.parse(hcaptcha.output).result.challenge).toEqual({ type: 'hcaptcha', blocked: true });
 
+  // hCaptcha embeds `recaptchacompat=true` in its iframe URL; its own
+  // `recaptcha` substring must not misclassify the widget as reCAPTCHA.
+  const hcaptchaCompat = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<iframe src="https://hcaptcha.com/captcha/v2/api.js?recaptchacompat=true"></iframe>', '--timeout=5', '--json');
+  expect(JSON.parse(hcaptchaCompat.output).result.challenge).toEqual({ type: 'hcaptcha', blocked: true });
+
   const plain = await runCli('-s=captcha-widget', 'goto', 'data:text/html,<p>hello</p>', '--timeout=5', '--json');
   expect(JSON.parse(plain.output).result.challenge).toEqual({ type: 'none', blocked: false });
   await runCli('-s=captcha-widget', 'close');
 });
 
+test('scrape renders JS content, crawls with ok, redacts challenges, and extracts', async ({}) => {
+  // Each scrape spawns a CloakBrowser instance; Windows CI is slow enough that
+  // the default 30s budget is too tight for the full sequence.
+  test.setTimeout(120_000);
+  const server = http.createServer((req, res) => {
+    if (req.url.startsWith('/challenge')) {
+      res.writeHead(403, { 'content-type': 'text/html' });
+      res.end('<html><title>Just a moment...</title><body><p>Checking your browser before accessing, please enable JS.</p></body></html>');
+      return;
+    }
+    if (req.url.startsWith('/page2')) {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html><head><title>Page Two</title></head><body><h1>Second</h1><a href="/">Home</a></body></html>');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><head><title>Scrape Home</title></head><body><h1>Welcome</h1><div id="d"></div><a href="/page2">p2</a>' +
+        '<script>document.getElementById("d").innerText = "Rendered by JS";</script></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const page = await runCli('scrape', `${base}/`);
+    expect(page.exitCode, page.output).toBe(0);
+    const record = JSON.parse(page.output);
+    expect(record.ok).toBe(true);
+    expect(record.title).toBe('Scrape Home');
+    expect(record.status).toBe(200);
+    expect(record.text).toContain('Rendered by JS');
+    expect(record.attempts).toBe(1);
+    expect(record.retried).toBe(false);
+
+    const text = await runCli('scrape', `${base}/`, '--output-format=text');
+    expect(text.output.trim()).toContain('Welcome');
+
+    const schemaFile = path.join(test.info().outputPath(), 'schema.json');
+    fs.writeFileSync(schemaFile, JSON.stringify({ title: { selector: 'h1' } }));
+    const extracted = await runCli('scrape', `${base}/`, `--schema=${schemaFile}`);
+    expect(JSON.parse(extracted.output).extracted).toEqual({ title: 'Welcome' });
+
+    // Crawl succeeds with a positive `ok` (the summary has no scalar status).
+    const crawled = await runCli('scrape', `${base}/`, '--crawl', '--max-requests=5');
+    const crawlPayload = JSON.parse(crawled.output);
+    expect(crawlPayload.ok).toBe(true);
+    expect(crawlPayload.requestsProcessed).toBeGreaterThan(0);
+    expect(crawlPayload.results.map(r => r.title)).toEqual(expect.arrayContaining(['Scrape Home', 'Page Two']));
+    expect(crawlPayload.failedRequests).toEqual([]);
+    // --crawl --output-format=text must join the pages, not emit just a newline.
+    const crawlText = await runCli('scrape', `${base}/`, '--crawl', '--max-requests=5', '--output-format=text');
+    expect(crawlText.output.trim().length).toBeGreaterThan(0);
+    expect(crawlText.output).toContain('Welcome');
+
+    // Challenge pages are retried, redacted (never captured), and exit nonzero.
+    const challenged = await runCli('scrape', `${base}/challenge`, '--retry=1');
+    const challengePayload = JSON.parse(challenged.output);
+    expect(challengePayload.ok).toBe(false);
+    expect(challenged.exitCode).not.toBe(0);
+    expect(challengePayload.challenge).toEqual({ type: 'cloudflare', blocked: true });
+    expect(challengePayload.text).toBe('');
+    expect(challengePayload.html).toBe('');
+    expect(challengePayload.retried).toBe(true);
+
+    const badFormat = await runCli('scrape', `${base}/`, '--output-format=yaml');
+    expect(badFormat.exitCode).not.toBe(0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('scrape parses --help, ignores -s= session flags, and flattens CSV --select', async ({}) => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><head><title>Sel</title></head><body><h1 class="h">One</h1><p>The text</p></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+
+  try {
+    // --help and -h print the command help instead of failing on a missing URL.
+    const help = await runCli('scrape', '--help');
+    expect(help.exitCode).toBe(0);
+    expect(help.output).toContain('--max-requests');
+
+    // Scrape is sessionless: a -s=<name> flag must not be treated as the URL.
+    const scraped = await runCli('-s=scrape-cli-test', 'scrape', `${base}/`, '--select=.h', '--output-format=csv');
+    expect(scraped.exitCode).toBe(0);
+    const lines = scraped.output.trim().split('\n');
+    expect(lines[0].split(',')).toEqual(expect.arrayContaining(['text', 'html']));
+    expect(lines[1]).toContain('One');
+    expect(scraped.output).not.toContain('The text');
+    await runCli('-s=scrape-cli-test', 'close').catch(() => {});
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
 test('fetch supports basic auth via --user/--password', async ({}) => {
   const server = http.createServer((req, res) => {
     const auth = req.headers.authorization ?? '';
@@ -881,6 +852,93 @@ test('fetch --engine=browser requires a session and tags the result', async ({})
   expect(payload.result.body).toContain('plain-body');
   await runCli('-s=engine-browser', 'close');
 });
+
+test('fetch argv parser mimics minimist for separated option values', async () => {
+  const { parseCliArgv } = require('../cliEnhancements');
+  const { positional, flags } = parseCliArgv(
+      ['fetch', 'https://example.com/', '--method', 'POST', '--engine', 'httpcloak', '--data', '{"a":1}', '--json'],
+      'fetch',
+      new Set(['json', 'raw']));
+  expect(positional).toEqual(['https://example.com/']);
+  expect(flags).toEqual({ method: 'POST', engine: 'httpcloak', data: '{"a":1}', json: true });
+});
+
+test('fetch --engine=httpcloak sends --data as a raw body and separated flags parse', async ({}) => {
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ method: req.method, contentType: req.headers['content-type'] ?? null, body: rawBody }));
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const body = '{"a":1}';
+    // --engine httpcloak and --method POST as SEPARATE argv tokens (minimist
+    // style); --data must reach the server as the raw body, not a JSON-encoded
+    // quoted string.
+    const result = await runCli('fetch', base, '--engine', 'httpcloak', '--method', 'POST', '--data', body, '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok, result.output).toBe(true);
+    expect(payload.result.json.method).toBe('POST');
+    expect(payload.result.json.body).toBe(body);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('fetch 200-challenge pages never report success; default engine escalates', async ({}) => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><title>Just a moment...</title><body>Checking your browser before accessing, please enable JS.</body></html>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    // Explicit engine: keep the transport, but never present the challenge as success.
+    const explicit = await runCli('fetch', base, '--engine=wreq', '--json');
+    const explicitPayload = JSON.parse(explicit.output);
+    expect(explicit.exitCode).toBe(1);
+    expect(explicitPayload.ok).toBe(false);
+    expect(explicitPayload.error).toContain('Blocked by cloudflare challenge');
+    expect(explicitPayload.result.challenge).toEqual({ type: 'cloudflare', blocked: true });
+
+    // Default engine escalates to the browser session instead of emitting a
+    // stale success. Without a session the escalated path hits the session
+    // gate; with one, the in-page browser fetch of this CORS-less localhost
+    // fixture fails closed. Either way a blocked challenge is never reported
+    // as ok and the process exits nonzero.
+    const noSession = await runCli('fetch', base, '--json');
+    expect(noSession.exitCode).not.toBe(0);
+    expect(JSON.parse(noSession.output).ok).toBe(false);
+
+    await runCli('-s=fetch-esc', 'open', 'data:text/html,<title>E</title>');
+    const def = await runCli('-s=fetch-esc', 'fetch', base, '--json');
+    const defPayload = JSON.parse(def.output);
+    expect(defPayload.ok).toBe(false);
+    expect(def.exitCode).not.toBe(0);
+    await runCli('-s=fetch-esc', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
 test('wait-for waits for a selector or text to appear', async ({}) => {
   await runCli('-s=wait-for-test', 'open', 'data:text/html,<h1>Welcome</h1>');
   const found = await runCli('-s=wait-for-test', 'wait-for', 'text=Welcome', '--timeout=5', '--json');
@@ -955,6 +1013,16 @@ test('solve-captcha detects, times out, and injects tokens', async ({}) => {
   expect(injectedPayload.captcha).toBe('turnstile');
   expect(injectedPayload.solved).toBe(true);
   expect(injectedPayload.injected).toBe(true);
+
+  // hCaptcha widget with the `recaptchacompat` flag must be detected as
+  // hCaptcha, not reCAPTCHA, and use the hCaptcha token field.
+  const hcaptchaGoto = await runCli('-s=solve-captcha', 'goto', 'data:text/html,<iframe src="https://hcaptcha.com/captcha/v2/api.js?recaptchacompat=true"></iframe><input name="h-captcha-response" value="">', '--timeout=5', '--json');
+  expect(JSON.parse(hcaptchaGoto.output).result.challenge).toEqual({ type: 'hcaptcha', blocked: true });
+
+  const hcaptchaSol = await runCli('-s=solve-captcha', 'solve-captcha', '--timeout=1', '--json');
+  const hcaptchaPayload = JSON.parse(hcaptchaSol.output).result;
+  expect(hcaptchaPayload.captcha).toBe('hcaptcha');
+  expect(hcaptchaPayload.solved).toBe(false);
 
   await runCli('-s=solve-captcha', 'close');
 });
@@ -1149,7 +1217,11 @@ test('goto --retry retries transient 5xx and reports attempts', async ({}) => {
 
 test('goto warns on stderr when redirected to a different host', async ({}) => {
   const server = http.createServer((req, res) => {
-    res.writeHead(302, { location: 'https://example.com/' });
+    if (req.url === '/target') {
+      res.end('<html><body>Local redirect target</body></html>');
+      return;
+    }
+    res.writeHead(302, { location: `http://localhost:${address.port}/target` });
     res.end();
   });
   await new Promise<void>((resolve, reject) => {
@@ -1167,15 +1239,15 @@ test('goto warns on stderr when redirected to a different host', async ({}) => {
     expect(result.exitCode).toBe(0);
     expect(result.error).toContain('landed on a different host than requested');
     expect(result.error).toContain(`127.0.0.1:${address.port}`);
-    expect(result.error).toContain('https://example.com/');
+    expect(result.error).toContain(`http://localhost:${address.port}/target`);
 
     // Same-host navigation stays silent.
-    const sameHost = await runCli('-s=goto-redirect-warn', 'goto', 'https://example.com', '--timeout=15');
+    const sameHost = await runCli('-s=goto-redirect-warn', 'goto', `http://127.0.0.1:${address.port}/target`, '--timeout=15');
     expect(sameHost.exitCode).toBe(0);
     expect(sameHost.error).not.toContain('landed on a different host');
 
-    await runCli('-s=goto-redirect-warn', 'close');
   } finally {
+    await runCli('-s=goto-redirect-warn', 'close');
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
@@ -1196,19 +1268,13 @@ test('structured success payload always has a provider field', async ({}) => {
     provider: null,
   });
 
-  const fallback = {
-    requested: 'cloakbrowser',
-    active: 'patchright',
-    reason: 'cloakbrowser: executable missing',
-  };
-  expect(successPayload(undefined, 'done', [], { name: 'patchright', version: '1.61.1' }, fallback)).toEqual({
+  expect(successPayload(undefined, 'done', [], { name: 'cloakbrowser', version: '0.5.3' })).toEqual({
     ok: true,
     url: null,
     title: null,
     result: 'done',
     console: [],
-    provider: { name: 'patchright', version: '1.61.1' },
-    fallback,
+    provider: { name: 'cloakbrowser', version: '0.5.3' },
   });
 });
 
@@ -1468,4 +1534,211 @@ test('request-headers and response-headers --json return structured headers', as
   expect(typeof payload.result.headers).toBe('object');
   expect(payload.result.headers).toEqual(expect.objectContaining({ 'content-type': 'application/json' }));
   await runCli('-s=headers-test', 'close');
+});
+
+test('default config preserves context settings and rejects malformed JSON', async () => {
+  const cwd = test.info().outputPath();
+  const configPath = path.join(cwd, '.playwright', 'cli.config.json');
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify({ browser: { contextOptions: { locale: 'fr-FR', userAgent: 'HeadlessChrome' } } }));
+  try {
+    const opened = await runCli('-s=config-context', 'open', 'data:text/html,hello', '--json');
+    expect(opened.exitCode, opened.error).toBe(0);
+    const result = await runCli('-s=config-context', 'eval', '() => ({ language: navigator.language, ua: navigator.userAgent })', '--json');
+    expect(JSON.parse(result.output).result.language).toBe('fr-FR');
+    expect(JSON.parse(result.output).result.ua).not.toContain('HeadlessChrome');
+  } finally {
+    await runCli('-s=config-context', 'close');
+  }
+  fs.writeFileSync(configPath, '{');
+  try {
+    const invalid = await runCli('-s=config-invalid', 'open', 'data:text/html,hello', '--json');
+    expect(invalid.exitCode).toBe(1);
+    expect(invalid.output).toContain('cli.config.json');
+  } finally {
+    fs.rmSync(configPath);
+    await runCli('-s=config-invalid', 'close');
+  }
+});
+
+test('scrape retries empty and server-error pages and reports exhausted HTTP failures', async () => {
+  test.setTimeout(60_000);
+  const counts = new Map<string, number>();
+  const server = http.createServer((req, res) => {
+    const route = req.url ?? '/';
+    const count = (counts.get(route) ?? 0) + 1;
+    counts.set(route, count);
+    const failing = route === '/always' || count === 1;
+    res.writeHead(failing && route !== '/empty' ? 500 : 200, { 'content-type': 'text/html' });
+    res.end(failing && route === '/empty' ? '<html><body></body></html>' : `<html><body>${failing ? 'Service unavailable' : 'Recovered content'}</body></html>`);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    for (const route of ['/empty', '/error']) {
+      const result = await runCli('scrape', `${base}${route}`, '--retry=1');
+      const payload = JSON.parse(result.output);
+      expect(payload.text).toContain('Recovered content');
+      expect(payload.attempts).toBe(2);
+      expect(counts.get(route)).toBe(2);
+    }
+    const exhausted = await runCli('scrape', `${base}/always`, '--crawl', '--retry=0');
+    const payload = JSON.parse(exhausted.output);
+    expect(exhausted.exitCode).toBe(1);
+    expect(payload.ok).toBe(false);
+    expect(payload.results[0].challenge.blocked).toBe(false);
+    expect(payload.results[0].text).toContain('Service unavailable');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('scrape only reports CAPTCHA solved after the page unblocks', async () => {
+  test.setTimeout(60_000);
+  const server = http.createServer((req, res) => {
+    if (req.url === '/createTask' || req.url === '/getTaskResult') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(req.url === '/createTask' ? { errorId: 0, taskId: 'fixture' } : { errorId: 0, status: 'ready', solution: { token: 'fixture-token' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    const unblock = req.url === '/unblock' ? '<script>document.querySelector("input").addEventListener("change", () => setTimeout(() => { document.body.innerHTML = "<h1>Verified content</h1>"; }, 100));</script>' : '';
+    res.end(`<html><body><div class="cf-turnstile" data-sitekey="fixture">Challenge content</div><input name="cf-turnstile-response">${unblock}</body></html>`);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+  const base = `http://127.0.0.1:${address.port}`;
+  const options = { env: { CAPSOLVER_API_KEY: 'fixture-key', CAPSOLVER_API_URL: base } };
+  try {
+    const blocked = await runCliWithOptions(options, 'scrape', `${base}/blocked`, '--retry=0', '--timeout=5');
+    const payload = JSON.parse(blocked.output);
+    expect(payload.ok).toBe(false);
+    expect(payload.text).toBe('');
+    expect(blocked.exitCode).toBe(1);
+    const solved = await runCliWithOptions(options, 'scrape', `${base}/unblock`, '--retry=0', '--timeout=5');
+    expect(JSON.parse(solved.output).ok).toBe(true);
+    expect(JSON.parse(solved.output).text).toContain('Verified content');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('scrape accepts separated option values and short help', async () => {
+  const { parseScrapeArgs } = require('../scraper');
+  expect(parseScrapeArgs(['scrape', 'http://localhost/', '--select', 'h1', '--retry', '0', '--output-format', 'csv'])).toMatchObject({ select: 'h1', retries: 0, outputFormat: 'csv' });
+  const help = await runCli('scrape', '-h');
+  expect(help.exitCode).toBe(0);
+  expect(help.output).toContain('--output-format');
+});
+
+test('scrape bounds navigation retries and excludes redirected cross-origin content', async () => {
+  test.setTimeout(60_000);
+  const server = http.createServer((req, res) => {
+    if (req.url === '/hang') return;
+    if (req.url === '/redirect') {
+      res.writeHead(302, { location: `http://localhost:${address.port}/foreign` });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(req.url === '/foreign' ? '<html><body>Foreign content</body></html>' : '<html><body>Home<a href="/redirect">redirect</a></body></html>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const result = await runCli('scrape', base, '--crawl', '--max-requests=3', '--retry=0');
+    expect(result.exitCode, result.error).toBe(0);
+    expect(result.output).not.toContain('Foreign content');
+    expect(JSON.parse(result.output).results).toHaveLength(1);
+    const start = Date.now();
+    const hanging = await runCli('scrape', `${base}/hang`, '--timeout=1', '--retry=0');
+    expect(hanging.exitCode).toBe(1);
+    expect(JSON.parse(hanging.output).attempts).toBe(1);
+    expect(JSON.parse(hanging.output).challenge.blocked).toBe(false);
+    expect(Date.now() - start).toBeLessThan(15_000);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('httpcloak honors subsecond timeout and preserves binary bytes', async () => {
+  const bytes = Buffer.from([0, 128, 255, 1, 254]);
+  const timers = new Set<NodeJS.Timeout>();
+  const server = http.createServer((req, res) => {
+    if (req.url === '/slow') {
+      const timer = setTimeout(() => { res.end('too late'); timers.delete(timer); }, 1500);
+      timers.add(timer);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(bytes);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const timeout = await runCli('fetch', `${base}/slow`, '--engine=httpcloak', '--timeout=0.1', '--json');
+    expect(timeout.exitCode).toBe(1);
+    expect(JSON.parse(timeout.output).ok).toBe(false);
+    const binary = await runCli('fetch', base, '--engine=httpcloak', '--json');
+    expect(binary.exitCode, binary.output).toBe(0);
+    expect(JSON.parse(binary.output).result.body).toBe(bytes.toString('base64'));
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('default fetch escalates HTTP challenges and browser challenges fail closed', async () => {
+  let attempts = 0;
+  const server = http.createServer((req, res) => {
+    const challenge = req.url === '/blocked' || (req.url === '/recover' && ++attempts === 1);
+    res.writeHead(challenge && req.url === '/recover' ? 403 : 200, { 'content-type': 'text/html' });
+    res.end(challenge ? '<html><body>Checking your browser before accessing</body></html>' : '<html><body>Verified content</body></html>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    await runCli('-s=fetch-recover', 'open', base);
+    const recovered = await runCli('-s=fetch-recover', 'fetch', `${base}/recover`, '--json');
+    expect(JSON.parse(recovered.output).ok).toBe(true);
+    expect(JSON.parse(recovered.output).result.engine).toBe('browser');
+    expect(attempts).toBe(2);
+    const blocked = await runCli('-s=fetch-recover', 'fetch', `${base}/blocked`, '--json');
+    expect(JSON.parse(blocked.output).ok).toBe(false);
+    expect(JSON.parse(blocked.output).result.challenge.blocked).toBe(true);
+    expect(blocked.exitCode).toBe(1);
+    for (const flags of [[], ['--raw']]) {
+      const text = await runCli('-s=fetch-recover', 'fetch', `${base}/blocked`, ...flags);
+      expect(text.exitCode, text.output).toBe(1);
+    }
+  } finally {
+    await runCli('-s=fetch-recover', 'close');
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('published package includes the scrape runtime', async () => {
+  const output = execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['pack', '--dry-run', '--json'], {
+    cwd: path.join(__dirname, '..'),
+    encoding: 'utf8',
+    shell: process.platform === 'win32',
+  });
+  const packages: Record<string, { files: { path: string }[] }> = JSON.parse(output);
+  expect(Object.values(packages)[0].files.map(file => file.path)).toEqual(expect.arrayContaining([
+    'playwright-cli.js', 'browserProviders.js', 'cliEnhancements.js', 'scraper.js',
+  ]));
 });

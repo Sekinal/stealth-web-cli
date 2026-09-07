@@ -124,6 +124,31 @@ function extendHelp(help) {
       ].join('\n'),
     };
   }
+  if (!help.commands.scrape) {
+    help.commands.scrape = {
+      flags: {
+        crawl: 'boolean', 'max-requests': 'string', 'max-depth': 'string', 'same-origin': 'boolean',
+        concurrency: 'string', 'requests-per-minute': 'string', select: 'string', schema: 'string',
+        'output-format': 'string', output: 'string', timeout: 'string', retry: 'string',
+      },
+      args: ['url'],
+      help: [
+        'playwright-cli scrape <url>               scrape rendered content on stdout or --output=<file>',
+        '  --crawl                                 crawl the site following same-origin links',
+        '  --max-requests=<N>                      max pages (default 1, or 20 with --crawl)',
+        '  --max-depth=<N>                         max link depth to follow with --crawl',
+        '  --same-origin=true|false                only follow same-origin links (default true)',
+        '  --concurrency=<N>                       parallel pages (default 1)',
+        '  --requests-per-minute=<N>               rate-limit requests per minute (default: none)',
+        '  --select=<css>                          extract elements matching a selector',
+        '  --schema=<json-file>                    extract fields: { field: { selector, attr?, all? } }',
+        '  --output-format=json|text|markdown|csv  output format (default json)',
+        '  --output=<file>                         write output to a file instead of stdout',
+        '  --timeout=<seconds>                     per-page request timeout (default 60)',
+        '  --retry=<N>                             retries with backoff on 5xx/empty/challenge (default 3)',
+      ].join('\n'),
+    };
+  }
 }
 
 /**
@@ -199,6 +224,15 @@ function patchSession(Session, options) {
       let result = await originalRun.call(this, clientInfo, preparedArgs, runOptions);
       if (result.isError)
         process.exitCode = 1;
+      if (!result.isError && args._?.[0] === 'fetch') {
+        const parsed = normalizeUpstreamResult(parseJsonText(result.text));
+        const fetched = typeof parsed === 'object' ? parsed : parseJsonText(parseUpstreamSections(result.text).get('Result'));
+        if (fetched && typeof fetched === 'object' && 'body' in fetched && 'status' in fetched) {
+          const challenge = detectChallengeFromText(null, typeof fetched.body === 'string' ? fetched.body : '', typeof fetched.status === 'number' ? fetched.status : null);
+          if (challenge.blocked)
+            process.exitCode = 1;
+        }
+      }
       if (!result.isError && evalOutputPath) {
         rewriteEvalOutput(evalOutputPath);
         result = { ...result, text: absoluteEvalOutputLink(result.text, evalOutputPath) };
@@ -250,15 +284,20 @@ function patchSession(Session, options) {
       const cmd = args._?.[0];
       if (cmd === 'fetch' && normalizedResult && typeof normalizedResult === 'object' && !Array.isArray(normalizedResult)) {
         const fetchChallenge = detectChallengeFromText(null, typeof normalizedResult.body === 'string' ? normalizedResult.body : '', typeof normalizedResult.status === 'number' ? normalizedResult.status : null);
-        if (fetchChallenge.blocked)
+        if (fetchChallenge.blocked) {
           normalizedResult.challenge = fetchChallenge;
+          normalizedResult.failed = true;
+        }
       }
       if ((cmd === 'fetch' || cmd === 'goto') && normalizedResult && !Array.isArray(normalizedResult) && typeof normalizedResult === 'object' && normalizedResult.failed) {
+        process.exitCode = 1;
         const payload = {
           ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), fallbackDetailsForSession(this, options.env), proxyDetails(options.env)),
           ok: false,
           result: normalizedResult,
-          error: `HTTP ${normalizedResult.status} ${normalizedResult.statusText ?? ''}`.trim(),
+          error: normalizedResult.status < 400 && normalizedResult.challenge?.blocked
+            ? `Blocked by ${normalizedResult.challenge.type} challenge`
+            : `HTTP ${normalizedResult.status} ${normalizedResult.statusText ?? ''}`.trim(),
         };
         return { ...result, text: JSON.stringify(payload, null, 2) };
       }
@@ -398,8 +437,8 @@ function prepareCommandArgs(args) {
       const has = (sel) => !!document.querySelector(sel);
       return {
         turnstile: has('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-turnstile-widget]'),
-        recaptcha: has('iframe[src*="recaptcha"], .g-recaptcha, [class*="g-recaptcha"], [data-sitekey]'),
-        hcaptcha: has('iframe[src*="hcaptcha.com"], .h-captcha'),
+        recaptcha: has('iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"], .g-recaptcha, [class*="g-recaptcha"]'),
+        hcaptcha: has('iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"], .h-captcha, [data-hcaptcha-widget-id]'),
       };
     }).catch(() => ({ turnstile: false, recaptcha: false, hcaptcha: false }));
     if (dom.turnstile) return { type: 'turnstile', blocked: true };
@@ -482,9 +521,14 @@ function prepareCommandArgs(args) {
     const method = (prepared.method ?? 'GET').toUpperCase();
     if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(method))
       throw new Error(`Unsupported fetch method '${prepared.method}'. Expected one of: GET, POST, PUT, PATCH, DELETE, HEAD.`);
+    const forcedBrowser = process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH === '1';
+    delete process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH;
     const engineRaw = typeof prepared.engine === 'string' ? prepared.engine.toLowerCase() : '';
-    const engine = engineRaw === undefined || engineRaw === '' ? 'wreq' : engineRaw;
-    if (!['wreq', 'httpcloak', 'browser'].includes(engine))
+    const engine = forcedBrowser ? 'browser' : (engineRaw === undefined || engineRaw === '' ? 'wreq' : engineRaw);
+    // Plain engines (node-wreq/httpcloak) have no data:/about:/blob: transport;
+    // the browser run-code handles those schemes natively.
+    const resolvedEngine = /^(data|about|blob):/i.test(url) ? 'browser' : engine;
+    if (!['wreq', 'httpcloak', 'browser'].includes(resolvedEngine))
       throw new Error(`Unsupported --engine '${prepared.engine}'. Expected one of: wreq, httpcloak, browser.`);
     const data = prepared.data;
     const headerArg = prepared.header;
@@ -513,10 +557,10 @@ function prepareCommandArgs(args) {
 
     // Non-browser engines run in Node before the daemon is ever contacted;
     // stash the request spec for the run-wrapper to dispatch.
-    if (engine !== 'browser') {
+    if (resolvedEngine !== 'browser') {
       prepared._ = ['engine-fetch'];
       prepared._engineRequest = {
-        engine,
+        engine: resolvedEngine,
         url,
         method,
         data,
@@ -636,8 +680,8 @@ function prepareCommandArgs(args) {
     const holdButton = [...document.querySelectorAll('button, [role="button"]')].some(el => /hold|press/i.test(el.textContent || ''));
     return {
       turnstile: q('.cf-turnstile, [data-turnstile-widget], iframe[src*="challenges.cloudflare.com"]'),
-      recaptcha: q('.g-recaptcha, iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]'),
-      hcaptcha: q('.h-captcha, iframe[src*="hcaptcha.com"]'),
+      recaptcha: q('.g-recaptcha, iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"], iframe[title*="reCAPTCHA"]'),
+      hcaptcha: q('.h-captcha, iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"], [data-hcaptcha-widget-id]'),
       hold: holdButton,
     };
   });
@@ -663,7 +707,7 @@ function prepareCommandArgs(args) {
       const el = document.querySelector('[data-sitekey], .cf-turnstile, .g-recaptcha, .h-captcha');
       if (el && el.getAttribute('data-sitekey'))
         return el.getAttribute('data-sitekey');
-      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"]');
+      const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"]');
       if (iframe) {
         const m = (iframe.src || '').match(/[?&]k=([^&]+)/);
         if (m) return m[1];
@@ -715,10 +759,14 @@ function prepareCommandArgs(args) {
   }
   if (type === 'recaptcha') {
     try {
-      await page.evaluate(() => {
-        const box = document.querySelector('.recaptcha-checkbox, iframe[title*="reCAPTCHA"]');
-        if (box) box.click();
-      });
+      const frame = page.frameLocator('iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"]').first();
+      await frame.locator('.recaptcha-checkbox, [role="checkbox"]').first().click({ timeout: 3000 });
+    } catch {}
+  }
+  if (type === 'hcaptcha') {
+    try {
+      const frame = page.frameLocator('iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"]').first();
+      await frame.locator('.checkbox, [role="checkbox"], input[type="checkbox"]').first().click({ timeout: 3000 });
     } catch {}
   }
   try {
@@ -840,8 +888,8 @@ async function readPageMetadata(originalRun, session, clientInfo) {
         const has = (sel) => !!document.querySelector(sel);
         const captcha = {
           turnstile: has('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-turnstile-widget]'),
-          recaptcha: has('iframe[src*="recaptcha"], .g-recaptcha, [class*="g-recaptcha"], [data-sitekey]'),
-          hcaptcha: has('iframe[src*="hcaptcha.com"], .h-captcha'),
+          recaptcha: has('iframe[src*="recaptcha/api"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"], .g-recaptcha, [class*="g-recaptcha"]'),
+          hcaptcha: has('iframe[src*="hcaptcha.com"], iframe[src*="hcaptcha.net"], .h-captcha, [data-hcaptcha-widget-id]'),
         };
         return {
           url: location.href,
@@ -1211,9 +1259,11 @@ async function fetchWithHttpcloak(req) {
       try {
         const options = { headers: Object.keys(req.headers).length ? req.headers : undefined };
         if (req.data !== undefined)
-          options.json = req.data;
-        if (req.timeoutMs)
-          options.timeout = req.timeoutMs;
+          options.body = req.data;
+        if (req.timeoutMs) {
+          options.timeout = req.timeoutMs / 1000; // httpcloak timeouts are in seconds
+          options.signal = AbortSignal.timeout(req.timeoutMs);
+        }
         response = await session.request(req.method.toLowerCase(), req.url, options);
         lastError = null;
       } catch (error) {
@@ -1238,7 +1288,7 @@ async function fetchWithHttpcloak(req) {
   let body = response.text ?? '';
   let binary = false;
   if (isBinary) {
-    body = Buffer.from(body, 'binary').toString('base64');
+    body = Buffer.from(response.body || Buffer.alloc(0)).toString('base64');
     binary = true;
   }
   let json = null;
@@ -1285,9 +1335,11 @@ async function runEngineFetch(req) {
  * @param {any} session
  * @param {{ env: NodeJS.ProcessEnv }} options
  * @param {{ json?: boolean, raw?: boolean } | undefined} runOptions
- * @returns {Promise<{ isError: boolean, text: string }>}
+ * @param {(() => void) | undefined} [onEscalate] - when provided, a blocked
+ *   challenge is escalated to the browser instead of emitted (sessionless path).
+ * @returns {Promise<{ isError: boolean, text: string, escalate?: boolean }>}
  */
-async function emitEngineFetchResult(engineRequest, session, options, runOptions) {
+async function emitEngineFetchResult(engineRequest, session, options, runOptions, onEscalate) {
   let engineResult;
   try {
     engineResult = await runEngineFetch(engineRequest);
@@ -1296,17 +1348,34 @@ async function emitEngineFetchResult(engineRequest, session, options, runOptions
     process.exitCode = 1;
     return { isError: true, text: JSON.stringify(payload, null, 2) };
   }
+  // Surface challenge classification exactly like the browser path: a blocked
+  // response is never presented as ordinary content, even at HTTP 200.
+  const engineChallenge = detectChallengeFromText(
+      null,
+      typeof engineResult.body === 'string' ? engineResult.body : '',
+      typeof engineResult.status === 'number' ? engineResult.status : null);
+  if (engineChallenge.blocked) {
+    engineResult.challenge = engineChallenge;
+    // Escalate identified challenges, including HTTP 403/429, while ordinary
+    // HTTP errors retain their original response and transport.
+    if (onEscalate && engineChallenge.type !== 'none' && engineRequest.engine !== 'browser') {
+      process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH = '1';
+      return { isError: false, text: '', escalate: true };
+    }
+  }
+  const ok = !engineResult.failed && !engineChallenge.blocked;
   if (!runOptions?.json) {
-    if (engineResult.failed)
+    if (!ok)
       process.exitCode = 1;
     return { isError: false, text: runOptions?.raw && !engineResult.binary ? engineResult.body : JSON.stringify(engineResult, null, 2) };
   }
-  if (engineResult.failed)
+  if (!ok)
     process.exitCode = 1;
   return { isError: false, text: JSON.stringify({
     ...successPayload(null, engineResult, [], providerDetailsForSession(session, options.env), fallbackDetailsForSession(session, options.env), proxyDetails(options.env)),
-    ok: !engineResult.failed,
-    ...(engineResult.failed ? { error: `HTTP ${engineResult.status} ${engineResult.statusText ?? ''}`.trim() } : {}),
+    ok,
+    ...(!ok && engineResult.failed ? { error: `HTTP ${engineResult.status} ${engineResult.statusText ?? ''}`.trim() } : {}),
+    ...(!ok && !engineResult.failed ? { error: `Blocked by ${engineChallenge.type} challenge` } : {}),
   }, null, 2) };
 }
 
@@ -1324,28 +1393,76 @@ async function runEngineFetchFromArgv(argv, env) {
   const command = argv.find(arg => !arg.startsWith('-'));
   if (command !== 'fetch')
     return false;
-  const prepared = prepareCommandArgs({ _: argv.filter(arg => !arg.startsWith('-') || arg.startsWith('--')) });
+  // Build the args object the way upstream's parser (minimist) would so
+  // --method=POST, --method POST, --engine httpcloak, --data=... etc. reach
+  // prepareCommandArgs as top-level keys instead of being stranded inside the
+  // positional array.
+  const { positional, flags } = parseCliArgv(argv, 'fetch', new Set(['json', 'raw']));
+  const prepared = prepareCommandArgs({ _: ['fetch', ...positional], ...flags });
   if (prepared._?.[0] !== 'engine-fetch' || !prepared._engineRequest)
     return false;
-  // The upstream parser drops unknown flags, so --engine= never reaches
-  // prepared.engine when passed on the command line. Extract it from argv.
-  const engineFlag = argv.find(arg => arg.startsWith('--engine='));
-  if (engineFlag) {
-    const requested = engineFlag.slice('--engine='.length).toLowerCase();
-    if (!['wreq', 'httpcloak', 'browser'].includes(requested))
-      throw new Error(`Unsupported --engine '${engineFlag.slice(9)}'. Expected one of: wreq, httpcloak, browser.`);
-    if (requested === 'browser')
-      return false; // needs a live session; let the daemon path handle it
-    prepared._engineRequest.engine = requested;
-  }
-
+  if (prepared._engineRequest.engine === 'browser')
+    return false; // needs a live session; let the daemon path handle it
+  // Auto escalation to the browser on challenge applies only to the default
+  // engine; an explicit --engine= (either syntax) keeps the chosen transport.
+  const explicitEngine = typeof flags.engine === 'string' && flags.engine !== '';
   const outputMode = { json: argv.includes('--json'), raw: argv.includes('--raw') };
-  const result = await emitEngineFetchResult(prepared._engineRequest, undefined, { env }, outputMode);
+  const result = await emitEngineFetchResult(
+      prepared._engineRequest,
+      undefined,
+      { env },
+      outputMode,
+      explicitEngine ? undefined : () => true);
+  if (result.escalate)
+    return false; // program() re-enters with the browser engine forced
   if (outputMode.json)
     process.stdout.write(`${result.text}\n`);
   else
     process.stdout.write(result.text);
   return true;
+}
+
+/**
+ * Parse an argv list minimist-style: `--key=value`, `--key value` (string keys
+ * consume the following token), and bare `--boolean` for keys in `booleanKeys`.
+ * Single-dash tool flags (`-s=`, `-h`) and the bare command token are skipped.
+ *
+ * @param {string[]} argv
+ * @param {string} command
+ * @param {Set<string>} booleanKeys
+ * @returns {{ positional: string[], flags: Record<string, string | boolean> }}
+ */
+function parseCliArgv(argv, command, booleanKeys) {
+  const positional = [];
+  const flags = /** @type {Record<string, string | boolean>} */ ({});
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === command || arg.startsWith('-s='))
+      continue;
+    if (arg.startsWith('--')) {
+      const eq = arg.indexOf('=');
+      if (eq !== -1) {
+        flags[arg.slice(2, eq)] = arg.slice(eq + 1);
+        continue;
+      }
+      const key = arg.slice(2);
+      if (booleanKeys.has(key)) {
+        flags[key] = true;
+        continue;
+      }
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
+      continue;
+    }
+    if (!arg.startsWith('-'))
+      positional.push(arg);
+  }
+  return { positional, flags };
 }
 
 /**
@@ -1546,11 +1663,10 @@ function fallbackDetailsForSession(session, env) {
  * Recovers provider identity for sessions created before sidecar metadata was
  * written, or when a sidecar was lost.
  *
- * Claims are conservative: an upstream config (e.g. ambient
- * PLAYWRIGHT_MCP_BROWSER=chromium resolving to channel 'chrome-for-testing')
- * launches the same binary as our patchright config but WITHOUT the stealth
- * contextOptions, so the channel alone must not be reported as provider
- * provenance (issue #28).
+ * CloakBrowser is the sole provider, so claims are conservative and
+ * evidence-based: only a CloakBrowser binary path or `--fingerprint` launch
+ * arg proves provenance. An ambient upstream chromium config (issue #28)
+ * carries neither, so it reports no provider.
  *
  * @param {any} config
  */
@@ -1559,12 +1675,6 @@ function inferProviderDetails(config) {
   const launchOptions = browser?.launchOptions ?? {};
   const executablePath = typeof launchOptions.executablePath === 'string' ? launchOptions.executablePath.toLowerCase() : '';
   const args = /** @type {unknown[]} */ (Array.isArray(launchOptions.args) ? launchOptions.args : []);
-  const hasStealthContext = browser?.contextOptions?.userAgent !== undefined
-    || browser?.contextOptions?.viewport === null;
-  if (launchOptions.channel === 'chrome-for-testing' && hasStealthContext)
-    return { name: 'patchright', version: providerVersion('patchright') };
-  if (browser?.browserName === 'firefox' && executablePath.includes('camoufox'))
-    return { name: 'camoufox', version: providerVersion('camoufox') };
   if (executablePath.includes('cloakbrowser') || args.some(arg => typeof arg === 'string' && arg.startsWith('--fingerprint=')))
     return { name: 'cloakbrowser', version: providerVersion('cloakbrowser') };
   return undefined;
@@ -1729,9 +1839,11 @@ function firstCommand(argv) {
 
 module.exports = {
   configureCliEnhancements,
+  detectChallengeFromText,
   failurePayload,
   inferProviderDetails,
   normalizeUpstreamResult,
+  parseCliArgv,
   parseConsoleText,
   parseTimeoutMs,
   prepareCommandArgs,

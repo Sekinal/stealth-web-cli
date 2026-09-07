@@ -150,6 +150,40 @@ playwright-cli unroute "**/*.jpg"
 playwright-cli unroute
 ```
 
+### HTTP requests
+
+```bash
+playwright-cli fetch <url> [opts]    # raw body on stdout, composes with jq
+  --method=GET|POST|PUT|PATCH|DELETE|HEAD   HTTP method (default GET)
+  --data=<body>                             request body
+  --header="Key: Value"                     request header (comma-separated)
+  --timeout=<seconds> / --retry=<N>         timeout and retries on 5xx/network
+  --engine=wreq|httpcloak|browser           transport engine (default wreq)
+```
+
+`fetch` runs through fingerprint-matched plain-HTTP engines (`node-wreq`, `httpcloak`) without
+opening a browser. Default `wreq` escalates to the CloakBrowser session only when a challenge is
+detected; challenge-heavy or JS-rendered pages require an open session.
+
+### Scraping
+
+```bash
+playwright-cli scrape <url> [opts]   # render through CloakBrowser via Crawlee
+  --crawl                            follow same-origin links (rate-limited, deduped)
+  --max-requests=<N>                 max pages (default 1, or 20 with --crawl)
+  --max-depth=<N>                    max link depth with --crawl
+  --same-origin=true|false           only follow same-origin links (default true)
+  --concurrency=<N> / --requests-per-minute=<N>  parallel pages / rate limit
+  --select=<css> / --schema=<json-file>   field extraction without eval
+  --output-format=json|text|markdown|csv
+  --output=<file>                    write output to a file
+  --timeout=<seconds> / --retry=<N>  per-page timeout and retries (default 60 / 3)
+```
+
+Results report `attempts`/`retried`; challenge pages are retried (auto-solved via `CAPSOLVER_API_KEY`
+when present), surfaced as `challenge` with redacted content and a nonzero exit — never captured as
+content.
+
 ### DevTools
 
 ```bash
@@ -207,13 +241,11 @@ and JSON output recover the provider from browser configuration if older sidecar
 `eval --output=<file>` writes raw string values without JSON escaping and returns an absolute result
 path; use `--filename=<file>` for upstream JSON serialization.
 
-The default provider is CloakBrowser only. Patchright and Camoufox are opt-in through
-`PLAYWRIGHT_CLI_BROWSER_PROVIDER` (or an explicit comma-separated fallback order). Install
-Patchright's browser explicitly with `playwright-cli install-browser chrome-for-testing`; Camoufox's
-first explicitly selected open waits for its browser download. An explicit provider selection
-overrides upstream browser environment variables for that launch. Ambient upstream variables such
-as `PLAYWRIGHT_MCP_BROWSER` do not skip stealth selection — only `--browser`, `--config`, and
-`PLAYWRIGHT_MCP_CONFIG` do.
+CloakBrowser is the sole browser provider and is selected by default; the removed `patchright` and
+`camoufox` providers are rejected with a clear error. Explicit invocation-level `--browser`,
+`--config`, and `PLAYWRIGHT_MCP_CONFIG` skip provider selection. Ambient upstream variables such as
+`PLAYWRIGHT_MCP_BROWSER` do not skip stealth selection — only the invocation-level settings above
+do. An explicit provider selection overrides upstream browser environment variables for that launch.
 
 ```bash
 playwright-cli list --json
