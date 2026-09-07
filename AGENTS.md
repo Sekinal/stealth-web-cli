@@ -8,7 +8,7 @@ to discover from the code alone.
 
 `stealth-web-cli` (package name `stealth-web-cli`, binary `stealth-web-cli`,
 `playwright-cli` alias) is a stealth web-automation CLI layered on top of a
-patched Playwright ("patchright-core", used purely as the CLI/session transport):
+standard Playwright ("playwright-core", used as the CLI/session runtime):
 
 - **cloakbrowser** — the only browser provider. Fingerprint-randomizing Chromium
   build. The removed `patchright` and `camoufox` providers are rejected with a
@@ -19,7 +19,7 @@ generation) → `cliEnhancements.js` (CLI UX: goto/fetch interception, JSON
 payloads, challenge detection, solve-captcha, wait-for, retry logic).
 
 **Upstream lineage**: most of `cliEnhancements.js` wraps code from
-`node_modules/patchright-core/lib/...` (untyped, CommonJS). Match its style —
+`node_modules/playwright-core/lib/...` (untyped, CommonJS). Match its style —
 2-space indent, single quotes, JSDoc `@param` blocks with `@ts-check`, small
 functions, error-swallowing only for best-effort side effects.
 

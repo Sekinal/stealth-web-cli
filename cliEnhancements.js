@@ -20,7 +20,7 @@ const providerMetadataSuffix = '.provider.json';
  *   argv?: string[],
  *   command?: string,
  *   env?: NodeJS.ProcessEnv,
- *   providerConfig?: { enabled?: boolean, providers?: string[] },
+ *   providerConfig?: { enabled?: boolean },
  *   sessionModule: { Session: any },
  *   outputModule: { TextOutput: any, JsonOutput: any },
  *   help: any,
@@ -156,7 +156,7 @@ function extendHelp(help) {
  * @param {{
  *   command?: string,
  *   env: NodeJS.ProcessEnv,
- *   providerConfig?: { enabled?: boolean, providers?: string[] },
+ *   providerConfig?: { enabled?: boolean },
  *   stderr: NodeJS.WriteStream,
  * }} options
  */
@@ -174,7 +174,6 @@ function patchSession(Session, options) {
       writeProviderMetadata(clientInfo.daemonProfilesDir, result.sessionName, {
         provider,
         version: providerVersion(provider),
-        fallback: fallbackDetails(options.env),
       });
     }
     return result;
@@ -203,8 +202,7 @@ function patchSession(Session, options) {
         reportedReevaluation = true;
         const metadata = readProviderMetadata(this._sessionFile?.daemonDir, this.name);
         const active = metadata?.provider ? ` currently using '${metadata.provider}'` : '';
-        const providers = options.providerConfig?.providers?.join(', ') || 'configured providers';
-        options.stderr.write(`[playwright-cli] Session '${this.name}' is already running${active}; restarting it to re-evaluate provider order (${providers}).\n`);
+        options.stderr.write(`[playwright-cli] Session '${this.name}' is already running${active}; restarting it to re-apply the CloakBrowser configuration.\n`);
       }
       return await originalStop.apply(this, arguments);
     };
@@ -273,8 +271,7 @@ function patchSession(Session, options) {
             upstreamPayload?.error ?? result.text,
             undefined,
             [],
-            providerDetailsForSession(this, options.env),
-            fallbackDetailsForSession(this, options.env));
+            providerDetailsForSession(this, options.env));
         return { ...result, text: JSON.stringify(payload, null, 2) };
       }
 
@@ -292,7 +289,7 @@ function patchSession(Session, options) {
       if ((cmd === 'fetch' || cmd === 'goto') && normalizedResult && !Array.isArray(normalizedResult) && typeof normalizedResult === 'object' && normalizedResult.failed) {
         process.exitCode = 1;
         const payload = {
-          ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), fallbackDetailsForSession(this, options.env), proxyDetails(options.env)),
+          ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), proxyDetails(options.env)),
           ok: false,
           result: normalizedResult,
           error: normalizedResult.status < 400 && normalizedResult.challenge?.blocked
@@ -306,7 +303,6 @@ function patchSession(Session, options) {
           normalizedResult,
           consoleEntries,
           providerDetailsForSession(this, options.env),
-          fallbackDetailsForSession(this, options.env),
           proxyDetails(options.env));
       return { ...result, text: JSON.stringify(payload, null, 2) };
     } catch (error) {
@@ -318,8 +314,7 @@ function patchSession(Session, options) {
               error,
               page,
               consoleEntries,
-              providerDetailsForSession(this, options.env),
-              fallbackDetailsForSession(this, options.env));
+              providerDetailsForSession(this, options.env));
         }
       }
       throw error;
@@ -351,25 +346,21 @@ function patchOutput(outputModule, env) {
     JsonOutput.prototype._emit = function(value) {
       let payload;
       if (value?.result?.ok !== undefined && value.session) {
-        const fallback = value.result.fallback ?? fallbackDetails(env);
         payload = {
           ...value.result,
           provider: value.result.provider ?? providerDetails(env) ?? null,
-          ...(fallback ? { fallback } : {}),
           session: value.session,
           pid: value.pid,
         };
       } else if (value?.ok !== undefined) {
-        const fallback = value.fallback ?? fallbackDetails(env);
         payload = {
           ...value,
           provider: value.provider ?? providerDetails(env) ?? null,
-          ...(fallback ? { fallback } : {}),
         };
       } else if (value?.isError) {
-        payload = failurePayload(value.error, undefined, [], providerDetails(env), fallbackDetails(env));
+        payload = failurePayload(value.error, undefined, [], providerDetails(env));
       } else {
-        payload = successPayload(undefined, value, [], providerDetails(env), fallbackDetails(env), proxyDetails(env));
+        payload = successPayload(undefined, value, [], providerDetails(env), proxyDetails(env));
       }
       return originalEmit.call(this, payload);
     };
@@ -1344,7 +1335,7 @@ async function emitEngineFetchResult(engineRequest, session, options, runOptions
   try {
     engineResult = await runEngineFetch(engineRequest);
   } catch (error) {
-    const payload = failurePayload(error, undefined, [], providerDetailsForSession(session, options.env), fallbackDetailsForSession(session, options.env));
+    const payload = failurePayload(error, undefined, [], providerDetailsForSession(session, options.env));
     process.exitCode = 1;
     return { isError: true, text: JSON.stringify(payload, null, 2) };
   }
@@ -1372,7 +1363,7 @@ async function emitEngineFetchResult(engineRequest, session, options, runOptions
   if (!ok)
     process.exitCode = 1;
   return { isError: false, text: JSON.stringify({
-    ...successPayload(null, engineResult, [], providerDetailsForSession(session, options.env), fallbackDetailsForSession(session, options.env), proxyDetails(options.env)),
+    ...successPayload(null, engineResult, [], providerDetailsForSession(session, options.env), proxyDetails(options.env)),
     ok,
     ...(!ok && engineResult.failed ? { error: `HTTP ${engineResult.status} ${engineResult.statusText ?? ''}`.trim() } : {}),
     ...(!ok && !engineResult.failed ? { error: `Blocked by ${engineChallenge.type} challenge` } : {}),
@@ -1560,10 +1551,9 @@ function detectCaptchaChallenge(title, bodyText, captcha, status) {
  * @param {unknown} result
  * @param {string[]} consoleEntries
  * @param {{ name: string, version: string } | undefined} provider
- * @param {{ requested: string, active: string, reason: string } | undefined} fallback
  * @param {{ server: string, bypass?: string } | undefined} proxy
  */
-function successPayload(page, result, consoleEntries, provider, fallback, proxy) {
+function successPayload(page, result, consoleEntries, provider, proxy) {
   return {
     ok: true,
     url: page?.url ?? null,
@@ -1575,7 +1565,6 @@ function successPayload(page, result, consoleEntries, provider, fallback, proxy)
     ...(page?.bodyLength !== undefined ? { bodyLength: page.bodyLength, emptyBody: page.emptyBody } : {}),
     ...(page?.webdriver !== undefined ? { webdriver: page.webdriver } : {}),
     ...(proxy ? { proxy } : {}),
-    ...(fallback ? { fallback } : {}),
   };
 }
 
@@ -1584,9 +1573,8 @@ function successPayload(page, result, consoleEntries, provider, fallback, proxy)
  * @param {{ url: string | null, title: string | null } | undefined} [page]
  * @param {string[]} [consoleEntries]
  * @param {{ name: string, version: string } | undefined} [provider]
- * @param {{ requested: string, active: string, reason: string } | undefined} [fallback]
  */
-function failurePayload(error, page, consoleEntries = [], provider, fallback) {
+function failurePayload(error, page, consoleEntries = [], provider) {
   return {
     ok: false,
     url: page?.url ?? null,
@@ -1595,7 +1583,6 @@ function failurePayload(error, page, consoleEntries = [], provider, fallback) {
     console: consoleEntries,
     error: errorMessage(error),
     ...(provider ? { provider } : {}),
-    ...(fallback ? { fallback } : {}),
   };
 }
 
@@ -1642,24 +1629,6 @@ function providerDetailsForSession(session, env) {
 }
 
 /**
- * @param {NodeJS.ProcessEnv} env
- */
-function fallbackDetails(env) {
-  return require('./browserProviders').readProviderFallback(env);
-}
-
-/**
- * @param {any} session
- * @param {NodeJS.ProcessEnv} env
- */
-function fallbackDetailsForSession(session, env) {
-  const active = fallbackDetails(env);
-  if (active)
-    return active;
-  return readProviderMetadata(session?._sessionFile?.daemonDir, session?.name)?.fallback;
-}
-
-/**
  * Recovers provider identity for sessions created before sidecar metadata was
  * written, or when a sidecar was lost.
  *
@@ -1696,12 +1665,10 @@ function readProviderMetadata(daemonDir, sessionName) {
     return undefined;
   try {
     const value = JSON.parse(fs.readFileSync(providerMetadataPath(daemonDir, sessionName), 'utf8'));
-    if (typeof value.provider === 'string' && typeof value.version === 'string') {
-      const fallback = validateFallbackDetails(value.fallback);
+    if (value.provider === 'cloakbrowser' && typeof value.version === 'string') {
       return {
         provider: value.provider,
         version: value.version,
-        ...(fallback ? { fallback } : {}),
       };
     }
   } catch {
@@ -1710,22 +1677,9 @@ function readProviderMetadata(daemonDir, sessionName) {
 }
 
 /**
- * @param {unknown} value
- */
-function validateFallbackDetails(value) {
-  const fallback = /** @type {any} */ (value);
-  if (fallback && typeof fallback === 'object' &&
-      typeof fallback.requested === 'string' &&
-      typeof fallback.active === 'string' &&
-      typeof fallback.reason === 'string')
-    return { requested: fallback.requested, active: fallback.active, reason: fallback.reason };
-  return undefined;
-}
-
-/**
  * @param {string} daemonDir
  * @param {string} sessionName
- * @param {{ provider: string, version: string, fallback?: { requested: string, active: string, reason: string } }} metadata
+ * @param {{ provider: string, version: string }} metadata
  */
 function writeProviderMetadata(daemonDir, sessionName, metadata) {
   try {

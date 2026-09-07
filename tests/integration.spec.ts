@@ -20,6 +20,8 @@ import path from 'path';
 import { execFileSync, spawn } from 'child_process';
 import { test, expect } from '@playwright/test';
 
+const cloakBrowserVersion: string = JSON.parse(fs.readFileSync(path.join(__dirname, '../package-lock.json'), 'utf8')).packages['node_modules/cloakbrowser'].version;
+
 type CliResult = {
   output: string;
   error: string;
@@ -97,11 +99,11 @@ test('warns when installed skill is out of date', async ({}) => {
 test('browser provider selection respects explicit config', async ({}) => {
   const providers = require('../browserProviders');
 
-  expect(providers.resolveProviderOrder(undefined)).toEqual(['cloakbrowser']);
-  expect(providers.resolveProviderOrder('cloakbrowser')).toEqual(['cloakbrowser']);
-  expect(() => providers.resolveProviderOrder('patchright')).toThrow(/removed/);
-  expect(() => providers.resolveProviderOrder('camoufox')).toThrow(/removed/);
-  expect(() => providers.resolveProviderOrder('cloakbrowser,patchright')).toThrow(/removed/);
+  expect(providers.resolveProvider(undefined)).toBe('cloakbrowser');
+  expect(providers.resolveProvider('cloakbrowser')).toBe('cloakbrowser');
+  expect(() => providers.resolveProvider('patchright')).toThrow(/removed/);
+  expect(() => providers.resolveProvider('camoufox')).toThrow(/removed/);
+  expect(() => providers.resolveProvider('cloakbrowser,patchright')).toThrow(/removed/);
 
   expect(providers.hasExplicitBrowserConfig(['open', '--browser=firefox'], {})).toBe(true);
   expect(providers.hasExplicitBrowserConfig(['open', '--config', 'cli.json'], {})).toBe(true);
@@ -129,17 +131,17 @@ test('recovers provider identity from browser config when metadata is missing', 
   })).toBeUndefined();
   expect(inferProviderDetails({
     browser: { browserName: 'chromium', launchOptions: { executablePath: '/cache/.cloakbrowser/chrome' } },
-  })).toEqual({ name: 'cloakbrowser', version: '0.5.3' });
+  })).toEqual({ name: 'cloakbrowser', version: cloakBrowserVersion });
   expect(inferProviderDetails({
     browser: { browserName: 'chromium', launchOptions: { args: ['--fingerprint={"seed":42}'] } },
-  })).toEqual({ name: 'cloakbrowser', version: '0.5.3' });
+  })).toEqual({ name: 'cloakbrowser', version: cloakBrowserVersion });
   expect(inferProviderDetails({
     browser: { browserName: 'chromium', launchOptions: { channel: 'chrome' } },
   })).toBeUndefined();
 });
 
 test('ambient upstream browser env does not silence stealth provider selection', async ({}) => {
-  const { configureBrowserProviderFallbacks } = require('../browserProviders');
+  const { configureBrowserProvider } = require('../browserProviders');
   // PLAYWRIGHT_MCP_BROWSER is set system-wide for other tools (playwright MCP).
   // open must still activate the default stealth provider (issue #28).
   const env: NodeJS.ProcessEnv = {
@@ -151,13 +153,12 @@ test('ambient upstream browser env does not silence stealth provider selection',
       return { pid: 1, sessionName: 'default' };
     }
   }
-  const config = await configureBrowserProviderFallbacks({
+  const config = await configureBrowserProvider({
     command: 'open',
     env,
     sessionModule: { Session },
   });
   expect(config.enabled).toBe(true);
-  expect(config.providers).toEqual(['cloakbrowser']);
   expect(env.PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER).toBe('cloakbrowser');
   expect(env.PLAYWRIGHT_MCP_BROWSER).toBeUndefined();
   expect(env.PLAYWRIGHT_MCP_EXECUTABLE_PATH).toBeUndefined();
@@ -176,11 +177,11 @@ test('explicit --browser flag still skips provider selection', async ({}) => {
   expect(createProviderState('open', ['open'], {}).enabled).toBe(true);
 });
 
-test('reports declared versions when an optional provider package is unavailable', async ({}) => {
+test('missing mandatory CloakBrowser package does not claim a declared version', async ({}) => {
   const { providerVersion } = require('../browserProviders');
-  expect(providerVersion('cloakbrowser', () => {
-    throw new Error('optional package is not installed');
-  })).toBe('0.5.3');
+  expect(() => providerVersion('cloakbrowser', () => {
+    throw new Error('CloakBrowser is not installed');
+  })).toThrow('CloakBrowser is not installed');
 });
 
 test('package identity is stealth-web-cli with both bin entries', async ({}) => {
@@ -218,44 +219,36 @@ test('does not warn when installed skill only differs in line endings', async ({
 });
 
 test('a single CloakBrowser provider surfaces activation and launch failures', async ({}) => {
-  const { configureBrowserProviderFallbacks, readProviderFallback } = require('../browserProviders');
+  const { configureBrowserProvider } = require('../browserProviders');
 
   const activationEnv: NodeJS.ProcessEnv = {
     PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser',
   };
-  let activationError = '';
-  await expect(configureBrowserProviderFallbacks({
+  await expect(configureBrowserProvider({
     command: 'open',
     env: activationEnv,
     sessionModule: { Session: class { static async startDaemon() {} } },
-    stderr: { write: (value: string) => activationError += value },
     activateProvider: async () => {
       throw new Error('Cloak executable was not found');
     },
   })).rejects.toThrow('Cloak executable was not found');
-  expect(activationError).toBe('');
-  expect(readProviderFallback(activationEnv)).toBeUndefined();
 
   const launchEnv: NodeJS.ProcessEnv = {};
-  let launchError = '';
   class LaunchSession {
     static async startDaemon() {
       throw new Error('Daemon crashed during launch');
     }
   }
-  await configureBrowserProviderFallbacks({
+  await configureBrowserProvider({
     command: 'open',
     env: launchEnv,
     sessionModule: { Session: LaunchSession },
-    stderr: { write: (value: string) => launchError += value },
   });
   await expect(LaunchSession.startDaemon()).rejects.toThrow('Daemon crashed during launch');
-  expect(launchError).toBe('');
-  expect(readProviderFallback(launchEnv)).toBeUndefined();
 });
 
 test('an explicit provider override replaces conflicting upstream browser environment', async ({}) => {
-  const { configureBrowserProviderFallbacks } = require('../browserProviders');
+  const { configureBrowserProvider } = require('../browserProviders');
   const env: NodeJS.ProcessEnv = {
     PLAYWRIGHT_CLI_BROWSER_PROVIDER: 'cloakbrowser',
     PLAYWRIGHT_MCP_BROWSER: 'chromium',
@@ -267,7 +260,7 @@ test('an explicit provider override replaces conflicting upstream browser enviro
     }
   }
 
-  await configureBrowserProviderFallbacks({
+  await configureBrowserProvider({
     command: 'open',
     env,
     sessionModule: { Session },
@@ -283,7 +276,7 @@ test('open fails when CloakBrowser is unavailable', async ({}) => {
     env: {
       CLOAKBROWSER_BINARY_PATH: missingCloak,
     },
-  }, '-s=fallback-json', 'open', 'data:text/html,<title>Fallback</title>', '--json');
+  }, '-s=cloak-unavailable', 'open', 'data:text/html,<title>Unavailable</title>', '--json');
   expect(opened.exitCode).not.toBe(0);
   expect(JSON.parse(opened.output)).toEqual(expect.objectContaining({
     ok: false,
@@ -307,7 +300,7 @@ test('a default-path .playwright/cli.config.json does not silently disable Cloak
     expect(opened.exitCode, opened.error).toBe(0);
     expect(JSON.parse(opened.output)).toEqual(expect.objectContaining({
       ok: true,
-      provider: { name: 'cloakbrowser', version: '0.5.3' },
+      provider: { name: 'cloakbrowser', version: cloakBrowserVersion },
     }));
   } finally {
     await runCliWithOptions({ cwd }, '-s=default-config-proxy', 'close');
@@ -317,7 +310,7 @@ test('a default-path .playwright/cli.config.json does not silently disable Cloak
 test('reports active provider, re-evaluates it, and lists the provider name', async ({}) => {
   const firstOpen = await runCli('-s=provider-report', 'open', 'data:text/html,<title>First</title>');
   expect(firstOpen).toEqual(expect.objectContaining({
-    output: expect.stringContaining('### Browser provider\n- name: cloakbrowser\n- version: 0.5.3'),
+    output: expect.stringContaining(`### Browser provider\n- name: cloakbrowser\n- version: ${cloakBrowserVersion}`),
     exitCode: 0,
   }));
 
@@ -335,12 +328,12 @@ test('reports active provider, re-evaluates it, and lists the provider name', as
   const sidecarJson = await runCli('-s=provider-report', 'eval', '() => document.title', '--json');
   expect(JSON.parse(sidecarJson.output)).toEqual(expect.objectContaining({
     ok: true,
-    provider: { name: 'cloakbrowser', version: '0.5.3' },
+    provider: { name: 'cloakbrowser', version: cloakBrowserVersion },
   }));
 
   const secondOpen = await runCli('-s=provider-report', 'open', 'data:text/html,<title>Second</title>');
   expect(secondOpen).toEqual(expect.objectContaining({
-    error: expect.stringContaining("restarting it to re-evaluate provider order (cloakbrowser)"),
+    error: expect.stringContaining("restarting it to re-apply the CloakBrowser configuration"),
     exitCode: 0,
   }));
 
@@ -367,7 +360,7 @@ test('session without sidecar does not claim provider provenance from channel al
   expect(payload.ok).toBe(true);
   // No sidecar, but the generated CloakBrowser config embeds its binary path /
   // fingerprint args, so provenance is recovered from that evidence.
-  expect(payload.provider).toEqual({ name: 'cloakbrowser', version: '0.5.3' });
+  expect(payload.provider).toEqual({ name: 'cloakbrowser', version: cloakBrowserVersion });
 
   await runCli('-s=channel-only', 'close');
 });
@@ -379,7 +372,7 @@ test('emits stable structured output with page metadata and provider details', a
     ok: true,
     title: 'Structured',
     console: [],
-    provider: { name: 'cloakbrowser', version: '0.5.3' },
+    provider: { name: 'cloakbrowser', version: cloakBrowserVersion },
     session: 'json-output',
   }));
   expect(openJson.url).toContain('data:text/html');
@@ -391,7 +384,7 @@ test('emits stable structured output with page metadata and provider details', a
     title: 'Structured',
     result: { answer: 42, text: 'Hello' },
     console: [],
-    provider: { name: 'cloakbrowser', version: '0.5.3' },
+    provider: { name: 'cloakbrowser', version: cloakBrowserVersion },
     challenge: { type: 'none', blocked: false },
     bodyLength: 5,
     emptyBody: false,
@@ -421,7 +414,7 @@ test('writes complete eval results with --output', async ({}) => {
   expect(JSON.parse(evaluated.output)).toEqual(expect.objectContaining({
     ok: true,
     result: `- [Evaluation result](${outputFile})`,
-    provider: { name: 'cloakbrowser', version: '0.5.3' },
+    provider: { name: 'cloakbrowser', version: cloakBrowserVersion },
   }));
   expect(fs.readFileSync(outputFile, 'utf8')).toBe(expected);
 
@@ -1182,6 +1175,12 @@ test('goto reports soft 404 as failure', async ({}) => {
 test('goto --retry retries transient 5xx and reports attempts', async ({}) => {
   let requests = 0;
   const server = http.createServer((req, res) => {
+    // Count document attempts, independently of browser favicon requests.
+    if (req.url !== '/') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     requests++;
     if (requests === 1) {
       res.writeHead(500, { 'content-type': 'text/plain' });
@@ -1208,8 +1207,8 @@ test('goto --retry retries transient 5xx and reports attempts', async ({}) => {
     expect(payload.result.attempts).toBe(2);
     expect(payload.result.retried).toBe(true);
     expect(requests).toBe(2);
-    await runCli('-s=goto-retry', 'close');
   } finally {
+    await runCli('-s=goto-retry', 'close');
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
@@ -1268,13 +1267,13 @@ test('structured success payload always has a provider field', async ({}) => {
     provider: null,
   });
 
-  expect(successPayload(undefined, 'done', [], { name: 'cloakbrowser', version: '0.5.3' })).toEqual({
+  expect(successPayload(undefined, 'done', [], { name: 'cloakbrowser', version: cloakBrowserVersion })).toEqual({
     ok: true,
     url: null,
     title: null,
     result: 'done',
     console: [],
-    provider: { name: 'cloakbrowser', version: '0.5.3' },
+    provider: { name: 'cloakbrowser', version: cloakBrowserVersion },
   });
 });
 
@@ -1741,4 +1740,68 @@ test('published package includes the scrape runtime', async () => {
   expect(Object.values(packages)[0].files.map(file => file.path)).toEqual(expect.arrayContaining([
     'playwright-cli.js', 'browserProviders.js', 'cliEnhancements.js', 'scraper.js',
   ]));
+});
+
+test('runtime dependency graph contains standard Playwright and no Patchright', async () => {
+  const pkg = require('../package.json');
+  const lock = JSON.parse(fs.readFileSync(path.join(__dirname, '../package-lock.json'), 'utf8'));
+  expect(pkg.dependencies['playwright-core']).toBe(pkg.dependencies.playwright);
+  expect(pkg.dependencies).not.toHaveProperty('patchright-core');
+  expect(Object.keys(lock.packages).some(name => /(?:^|\/)patchright(?:-core)?$/.test(name))).toBe(false);
+});
+
+test('standard Playwright controls CloakBrowser without loading Patchright', async () => {
+  const hook = test.info().outputPath('reject-patchright.cjs');
+  fs.writeFileSync(hook, `
+    const Module = require('module');
+    const originalLoad = Module._load;
+    Module._load = function(id, ...args) {
+      if (/patchright/.test(id)) throw new Error('Patchright must not load');
+      return originalLoad.call(this, id, ...args);
+    };
+  `);
+  const options = { env: { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${JSON.stringify(hook)}` } };
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html');
+    res.end(req.url === '/frame' ? '<button onclick="parent.document.querySelector(\'h1\').textContent=\'Clicked\'">Click me</button>' : '<html><body><h1>Ready</h1><iframe src="/frame"></iframe></body></html>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+  const url = `http://127.0.0.1:${address.port}/`;
+  try {
+    const opened = await runCliWithOptions(options, '-s=standard-runtime', 'open', url, '--json');
+    expect(opened.exitCode, opened.output || opened.error).toBe(0);
+    expect(JSON.parse(opened.output).provider.name).toBe('cloakbrowser');
+    const result = await runCliWithOptions(options, '-s=standard-runtime', 'run-code', `async page => {
+      await page.addInitScript(() => { window.runtimeInit = 'installed'; });
+      await page.goto(${JSON.stringify(url)});
+      await page.frameLocator('iframe').getByRole('button').click();
+      return await page.evaluate(() => ({ init: window.runtimeInit, text: document.querySelector('h1').textContent, webdriver: navigator.webdriver, ua: navigator.userAgent }));
+    }`, '--json');
+    expect(result.exitCode, result.output).toBe(0);
+    expect(JSON.parse(result.output).result).toMatchObject({ init: 'installed', text: 'Clicked', webdriver: false });
+    expect(JSON.parse(result.output).result.ua).not.toContain('HeadlessChrome');
+  } finally {
+    await runCliWithOptions(options, '-s=standard-runtime', 'close');
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('removed provider metadata and fallback state cannot claim active provenance', async () => {
+  try {
+    await runCli('-s=removed-metadata', 'open', 'data:text/html,<title>Current</title>');
+    const daemonRoot = path.join(test.info().outputPath(), 'daemon');
+    const relative = fs.readdirSync(daemonRoot, { recursive: true }).map(String).find(file => file.endsWith('removed-metadata.provider.json'));
+    expect(relative).toBeTruthy();
+    const metadata = path.join(daemonRoot, relative!);
+    fs.writeFileSync(metadata, JSON.stringify({ provider: 'patchright', version: 'old', fallback: { requested: 'camoufox', active: 'patchright', reason: 'legacy' } }));
+    const result = await runCli('-s=removed-metadata', 'eval', '() => document.title', '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.provider.name).toBe('cloakbrowser');
+    expect(payload).not.toHaveProperty('fallback');
+  } finally {
+    await runCli('-s=removed-metadata', 'close');
+  }
 });
