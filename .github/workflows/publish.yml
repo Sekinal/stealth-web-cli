@@ -6,7 +6,6 @@ on:
 
 jobs:
   publish-npm:
-    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -17,5 +16,20 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org/
+      - name: Check whether this version is already published
+        id: registry
+        run: |
+          node <<'JS'
+          const fs = require('fs');
+          const { name, version } = require('./package.json');
+          (async () => {
+            const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(name)}/${encodeURIComponent(version)}`);
+            if (response.status !== 200 && response.status !== 404)
+              throw new Error(`Registry check failed: HTTP ${response.status}`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `published=${response.status === 200}\n`);
+          })().catch(error => { console.error(error.message); process.exitCode = 1; });
+          JS
       - run: npm ci
-      - run: npm publish
+        if: steps.registry.outputs.published != 'true'
+      - run: npm publish --access public
+        if: steps.registry.outputs.published != 'true'
