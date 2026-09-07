@@ -291,6 +291,26 @@ test('open fails when CloakBrowser is unavailable', async ({}) => {
   }));
 });
 
+test('a default-path .playwright/cli.config.json does not silently disable CloakBrowser (issue 37)', async ({}) => {
+  const cwd = test.info().outputPath();
+  fs.mkdirSync(path.join(cwd, '.playwright'), { recursive: true });
+  // The documented proxy setup lives at the default config path; before the
+  // fix it was promoted to a CLI-level override that shadowed the generated
+  // provider config, falling back to a vanilla Chrome channel.
+  fs.writeFileSync(
+      path.join(cwd, '.playwright', 'cli.config.json'),
+      JSON.stringify({ browser: { launchOptions: { proxy: { server: 'http://user:pass@127.0.0.1:1' } } } }),
+  );
+
+  const opened = await runCliWithOptions({ cwd }, 'open', 'data:text/html,<title>P37</title>', '--json');
+  expect(opened.exitCode, opened.error).toBe(0);
+  expect(JSON.parse(opened.output)).toEqual(expect.objectContaining({
+    ok: true,
+    provider: { name: 'cloakbrowser', version: '0.5.3' },
+  }));
+  await runCliWithOptions({ cwd }, 'close');
+});
+
 test('reports active provider, re-evaluates it, and lists the provider name', async ({}) => {
   const firstOpen = await runCli('-s=provider-report', 'open', 'data:text/html,<title>First</title>');
   expect(firstOpen).toEqual(expect.objectContaining({
