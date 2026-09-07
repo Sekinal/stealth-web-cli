@@ -302,13 +302,16 @@ test('a default-path .playwright/cli.config.json does not silently disable Cloak
       JSON.stringify({ browser: { launchOptions: { proxy: { server: 'http://user:pass@127.0.0.1:1' } } } }),
   );
 
-  const opened = await runCliWithOptions({ cwd }, 'open', 'data:text/html,<title>P37</title>', '--json');
-  expect(opened.exitCode, opened.error).toBe(0);
-  expect(JSON.parse(opened.output)).toEqual(expect.objectContaining({
-    ok: true,
-    provider: { name: 'cloakbrowser', version: '0.5.3' },
-  }));
-  await runCliWithOptions({ cwd }, 'close');
+  try {
+    const opened = await runCliWithOptions({ cwd }, '-s=default-config-proxy', 'open', 'data:text/html,<title>P37</title>', '--json');
+    expect(opened.exitCode, opened.error).toBe(0);
+    expect(JSON.parse(opened.output)).toEqual(expect.objectContaining({
+      ok: true,
+      provider: { name: 'cloakbrowser', version: '0.5.3' },
+    }));
+  } finally {
+    await runCliWithOptions({ cwd }, '-s=default-config-proxy', 'close');
+  }
 });
 
 test('reports active provider, re-evaluates it, and lists the provider name', async ({}) => {
@@ -605,13 +608,13 @@ test('fetch detects anti-bot challenge types from status and body', async ({}) =
     await runCli('-s=fetch-challenge-test', 'open', 'data:text/html,<title>CH</title>');
     const base = `http://127.0.0.1:${address.port}`;
 
-    const datadome = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/datadome`, '--json');
+    const datadome = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/datadome`, '--engine=wreq', '--json');
     expect(JSON.parse(datadome.output).result.challenge).toEqual({ type: 'datadome', blocked: true });
 
-    const akamai = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/akamai`, '--json');
+    const akamai = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/akamai`, '--engine=wreq', '--json');
     expect(JSON.parse(akamai.output).result.challenge).toEqual({ type: 'blocked', blocked: true });
 
-    const plain = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/plain`, '--json');
+    const plain = await runCli('-s=fetch-challenge-test', 'fetch', `${base}/plain`, '--engine=wreq', '--json');
     expect(JSON.parse(plain.output).result.challenge).toEqual({ type: '403', blocked: true });
     await runCli('-s=fetch-challenge-test', 'close');
   } finally {
@@ -1214,7 +1217,11 @@ test('goto --retry retries transient 5xx and reports attempts', async ({}) => {
 
 test('goto warns on stderr when redirected to a different host', async ({}) => {
   const server = http.createServer((req, res) => {
-    res.writeHead(302, { location: 'https://example.com/' });
+    if (req.url === '/target') {
+      res.end('<html><body>Local redirect target</body></html>');
+      return;
+    }
+    res.writeHead(302, { location: `http://localhost:${address.port}/target` });
     res.end();
   });
   await new Promise<void>((resolve, reject) => {
@@ -1232,15 +1239,15 @@ test('goto warns on stderr when redirected to a different host', async ({}) => {
     expect(result.exitCode).toBe(0);
     expect(result.error).toContain('landed on a different host than requested');
     expect(result.error).toContain(`127.0.0.1:${address.port}`);
-    expect(result.error).toContain('https://example.com/');
+    expect(result.error).toContain(`http://localhost:${address.port}/target`);
 
     // Same-host navigation stays silent.
-    const sameHost = await runCli('-s=goto-redirect-warn', 'goto', 'https://example.com', '--timeout=15');
+    const sameHost = await runCli('-s=goto-redirect-warn', 'goto', `http://127.0.0.1:${address.port}/target`, '--timeout=15');
     expect(sameHost.exitCode).toBe(0);
     expect(sameHost.error).not.toContain('landed on a different host');
 
-    await runCli('-s=goto-redirect-warn', 'close');
   } finally {
+    await runCli('-s=goto-redirect-warn', 'close');
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
@@ -1527,4 +1534,211 @@ test('request-headers and response-headers --json return structured headers', as
   expect(typeof payload.result.headers).toBe('object');
   expect(payload.result.headers).toEqual(expect.objectContaining({ 'content-type': 'application/json' }));
   await runCli('-s=headers-test', 'close');
+});
+
+test('default config preserves context settings and rejects malformed JSON', async () => {
+  const cwd = test.info().outputPath();
+  const configPath = path.join(cwd, '.playwright', 'cli.config.json');
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify({ browser: { contextOptions: { locale: 'fr-FR', userAgent: 'HeadlessChrome' } } }));
+  try {
+    const opened = await runCli('-s=config-context', 'open', 'data:text/html,hello', '--json');
+    expect(opened.exitCode, opened.error).toBe(0);
+    const result = await runCli('-s=config-context', 'eval', '() => ({ language: navigator.language, ua: navigator.userAgent })', '--json');
+    expect(JSON.parse(result.output).result.language).toBe('fr-FR');
+    expect(JSON.parse(result.output).result.ua).not.toContain('HeadlessChrome');
+  } finally {
+    await runCli('-s=config-context', 'close');
+  }
+  fs.writeFileSync(configPath, '{');
+  try {
+    const invalid = await runCli('-s=config-invalid', 'open', 'data:text/html,hello', '--json');
+    expect(invalid.exitCode).toBe(1);
+    expect(invalid.output).toContain('cli.config.json');
+  } finally {
+    fs.rmSync(configPath);
+    await runCli('-s=config-invalid', 'close');
+  }
+});
+
+test('scrape retries empty and server-error pages and reports exhausted HTTP failures', async () => {
+  test.setTimeout(60_000);
+  const counts = new Map<string, number>();
+  const server = http.createServer((req, res) => {
+    const route = req.url ?? '/';
+    const count = (counts.get(route) ?? 0) + 1;
+    counts.set(route, count);
+    const failing = route === '/always' || count === 1;
+    res.writeHead(failing && route !== '/empty' ? 500 : 200, { 'content-type': 'text/html' });
+    res.end(failing && route === '/empty' ? '<html><body></body></html>' : `<html><body>${failing ? 'Service unavailable' : 'Recovered content'}</body></html>`);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    for (const route of ['/empty', '/error']) {
+      const result = await runCli('scrape', `${base}${route}`, '--retry=1');
+      const payload = JSON.parse(result.output);
+      expect(payload.text).toContain('Recovered content');
+      expect(payload.attempts).toBe(2);
+      expect(counts.get(route)).toBe(2);
+    }
+    const exhausted = await runCli('scrape', `${base}/always`, '--crawl', '--retry=0');
+    const payload = JSON.parse(exhausted.output);
+    expect(exhausted.exitCode).toBe(1);
+    expect(payload.ok).toBe(false);
+    expect(payload.results[0].challenge.blocked).toBe(false);
+    expect(payload.results[0].text).toContain('Service unavailable');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('scrape only reports CAPTCHA solved after the page unblocks', async () => {
+  test.setTimeout(60_000);
+  const server = http.createServer((req, res) => {
+    if (req.url === '/createTask' || req.url === '/getTaskResult') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(req.url === '/createTask' ? { errorId: 0, taskId: 'fixture' } : { errorId: 0, status: 'ready', solution: { token: 'fixture-token' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    const unblock = req.url === '/unblock' ? '<script>document.querySelector("input").addEventListener("change", () => setTimeout(() => { document.body.innerHTML = "<h1>Verified content</h1>"; }, 100));</script>' : '';
+    res.end(`<html><body><div class="cf-turnstile" data-sitekey="fixture">Challenge content</div><input name="cf-turnstile-response">${unblock}</body></html>`);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+  const base = `http://127.0.0.1:${address.port}`;
+  const options = { env: { CAPSOLVER_API_KEY: 'fixture-key', CAPSOLVER_API_URL: base } };
+  try {
+    const blocked = await runCliWithOptions(options, 'scrape', `${base}/blocked`, '--retry=0', '--timeout=5');
+    const payload = JSON.parse(blocked.output);
+    expect(payload.ok).toBe(false);
+    expect(payload.text).toBe('');
+    expect(blocked.exitCode).toBe(1);
+    const solved = await runCliWithOptions(options, 'scrape', `${base}/unblock`, '--retry=0', '--timeout=5');
+    expect(JSON.parse(solved.output).ok).toBe(true);
+    expect(JSON.parse(solved.output).text).toContain('Verified content');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('scrape accepts separated option values and short help', async () => {
+  const { parseScrapeArgs } = require('../scraper');
+  expect(parseScrapeArgs(['scrape', 'http://localhost/', '--select', 'h1', '--retry', '0', '--output-format', 'csv'])).toMatchObject({ select: 'h1', retries: 0, outputFormat: 'csv' });
+  const help = await runCli('scrape', '-h');
+  expect(help.exitCode).toBe(0);
+  expect(help.output).toContain('--output-format');
+});
+
+test('scrape bounds navigation retries and excludes redirected cross-origin content', async () => {
+  test.setTimeout(60_000);
+  const server = http.createServer((req, res) => {
+    if (req.url === '/hang') return;
+    if (req.url === '/redirect') {
+      res.writeHead(302, { location: `http://localhost:${address.port}/foreign` });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(req.url === '/foreign' ? '<html><body>Foreign content</body></html>' : '<html><body>Home<a href="/redirect">redirect</a></body></html>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const result = await runCli('scrape', base, '--crawl', '--max-requests=3', '--retry=0');
+    expect(result.exitCode, result.error).toBe(0);
+    expect(result.output).not.toContain('Foreign content');
+    expect(JSON.parse(result.output).results).toHaveLength(1);
+    const start = Date.now();
+    const hanging = await runCli('scrape', `${base}/hang`, '--timeout=1', '--retry=0');
+    expect(hanging.exitCode).toBe(1);
+    expect(JSON.parse(hanging.output).attempts).toBe(1);
+    expect(JSON.parse(hanging.output).challenge.blocked).toBe(false);
+    expect(Date.now() - start).toBeLessThan(15_000);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('httpcloak honors subsecond timeout and preserves binary bytes', async () => {
+  const bytes = Buffer.from([0, 128, 255, 1, 254]);
+  const timers = new Set<NodeJS.Timeout>();
+  const server = http.createServer((req, res) => {
+    if (req.url === '/slow') {
+      const timer = setTimeout(() => { res.end('too late'); timers.delete(timer); }, 1500);
+      timers.add(timer);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(bytes);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const timeout = await runCli('fetch', `${base}/slow`, '--engine=httpcloak', '--timeout=0.1', '--json');
+    expect(timeout.exitCode).toBe(1);
+    expect(JSON.parse(timeout.output).ok).toBe(false);
+    const binary = await runCli('fetch', base, '--engine=httpcloak', '--json');
+    expect(binary.exitCode, binary.output).toBe(0);
+    expect(JSON.parse(binary.output).result.body).toBe(bytes.toString('base64'));
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('default fetch escalates HTTP challenges and browser challenges fail closed', async () => {
+  let attempts = 0;
+  const server = http.createServer((req, res) => {
+    const challenge = req.url === '/blocked' || (req.url === '/recover' && ++attempts === 1);
+    res.writeHead(challenge && req.url === '/recover' ? 403 : 200, { 'content-type': 'text/html' });
+    res.end(challenge ? '<html><body>Checking your browser before accessing</body></html>' : '<html><body>Verified content</body></html>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    await runCli('-s=fetch-recover', 'open', base);
+    const recovered = await runCli('-s=fetch-recover', 'fetch', `${base}/recover`, '--json');
+    expect(JSON.parse(recovered.output).ok).toBe(true);
+    expect(JSON.parse(recovered.output).result.engine).toBe('browser');
+    expect(attempts).toBe(2);
+    const blocked = await runCli('-s=fetch-recover', 'fetch', `${base}/blocked`, '--json');
+    expect(JSON.parse(blocked.output).ok).toBe(false);
+    expect(JSON.parse(blocked.output).result.challenge.blocked).toBe(true);
+    expect(blocked.exitCode).toBe(1);
+    for (const flags of [[], ['--raw']]) {
+      const text = await runCli('-s=fetch-recover', 'fetch', `${base}/blocked`, ...flags);
+      expect(text.exitCode, text.output).toBe(1);
+    }
+  } finally {
+    await runCli('-s=fetch-recover', 'close');
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('published package includes the scrape runtime', async () => {
+  const output = execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['pack', '--dry-run', '--json'], {
+    cwd: path.join(__dirname, '..'),
+    encoding: 'utf8',
+    shell: process.platform === 'win32',
+  });
+  const packages: Record<string, { files: { path: string }[] }> = JSON.parse(output);
+  expect(Object.values(packages)[0].files.map(file => file.path)).toEqual(expect.arrayContaining([
+    'playwright-cli.js', 'browserProviders.js', 'cliEnhancements.js', 'scraper.js',
+  ]));
 });

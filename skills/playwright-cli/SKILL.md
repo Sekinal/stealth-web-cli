@@ -172,7 +172,7 @@ playwright-cli scrape <url> [opts]   # render through CloakBrowser via Crawlee
   --crawl                            follow same-origin links (rate-limited, deduped)
   --max-requests=<N>                 max pages (default 1, or 20 with --crawl)
   --max-depth=<N>                    max link depth with --crawl
-  --same-origin=true|false           only follow same-hostname links (default true)
+  --same-origin=true|false           only follow same-origin links (default true)
   --concurrency=<N> / --requests-per-minute=<N>  parallel pages / rate limit
   --select=<css> / --schema=<json-file>   field extraction without eval
   --output-format=json|text|markdown|csv

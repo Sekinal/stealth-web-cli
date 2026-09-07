@@ -47,7 +47,8 @@ const SCRAPE_HELP = `playwright-cli scrape <url>               scrape rendered c
   --same-origin=true|false                only follow same-origin links (default true)
   --concurrency=<N> / --requests-per-minute=<N>
                                           parallel pages / request rate limit
-  --select=<css> | --export=<format>      extract elements (--select) / output format (json|text|markdown|csv)
+  --select=<css>                          extract matching elements
+  --output-format=json|text|markdown|csv  output format (default json)
   --schema=<json-file>                    extract fields: { field: { selector, attr?, all? } }
   --output=<file>                         write output to a file instead of stdout
   --timeout=<seconds> / --retry=<N>       navigation timeout / retries with backoff (default 60 / 3)`;
@@ -64,19 +65,10 @@ const DETECT_SELECTORS = {
  * @param {string[]} argv
  */
 function parseScrapeArgs(argv) {
-  const positional = [];
-  const flags = {};
-  for (const arg of argv) {
-    if (arg === 'scrape') continue;
-    if (arg.startsWith('-s=')) continue; // session flag, never a URL
-    if (arg.startsWith('--')) {
-      const eq = arg.indexOf('=');
-      const key = eq === -1 ? arg.slice(2) : arg.slice(2, eq);
-      flags[key] = eq === -1 ? true : arg.slice(eq + 1);
-      continue;
-    }
-    positional.push(arg);
-  }
+  const { parseCliArgv } = require('./cliEnhancements');
+  const { positional, flags } = parseCliArgv(
+      argv.map(arg => arg === '-h' ? '--help' : arg), 'scrape',
+      new Set(['help', 'crawl', 'same-origin', 'json']));
 
   if (flags.help === true || flags.h === true) {
     return {
@@ -103,20 +95,20 @@ function parseScrapeArgs(argv) {
     throw new Error('scrape requires a URL (for example, scrape https://example.com).');
   if (!/^https?:\/\//i.test(url)) throw new Error(`Invalid URL '${url}': missing protocol. Use http:// or https://.`);
 
-  const crawl = flags.crawl === true;
+  const crawl = flags.crawl === true || flags.crawl === 'true';
   const maxRequests =
     flags['max-requests'] !== undefined
-      ? Math.max(1, parseInt(flags['max-requests'], 10) || 1)
+      ? Math.max(1, parseInt(String(flags['max-requests']), 10) || 1)
       : crawl
         ? DEFAULT_MAX_REQUESTS
         : 1;
   const maxDepth =
-    flags['max-depth'] !== undefined ? Math.max(0, parseInt(flags['max-depth'], 10) || 0) : DEFAULT_MAX_DEPTH;
-  const concurrency = flags.concurrency !== undefined ? Math.max(1, parseInt(flags.concurrency, 10) || 1) : 1;
+    flags['max-depth'] !== undefined ? Math.max(0, parseInt(String(flags['max-depth']), 10) || 0) : DEFAULT_MAX_DEPTH;
+  const concurrency = flags.concurrency !== undefined ? Math.max(1, parseInt(String(flags.concurrency), 10) || 1) : 1;
   const requestsPerMinute =
-    flags['requests-per-minute'] !== undefined ? Math.max(1, parseInt(flags['requests-per-minute'], 10) || 1) : 0;
+    flags['requests-per-minute'] !== undefined ? Math.max(1, parseInt(String(flags['requests-per-minute']), 10) || 1) : 0;
   const sameOrigin = flags['same-origin'] !== 'false';
-  const outputFormat = (flags['output-format'] ?? 'json').toLowerCase();
+  const outputFormat = String(flags['output-format'] ?? 'json').toLowerCase();
   if (!['json', 'text', 'markdown', 'csv'].includes(outputFormat))
     throw new Error(
       `Unsupported --output-format '${flags['output-format']}'. Expected one of: json, text, markdown, csv.`,
@@ -137,9 +129,9 @@ function parseScrapeArgs(argv) {
     schema: typeof flags.schema === 'string' && flags.schema ? flags.schema : null,
     timeoutSecs:
       flags.timeout !== undefined
-        ? Math.max(1, parseInt(flags.timeout, 10) || DEFAULT_TIMEOUT_SECS)
+        ? Math.max(1, parseInt(String(flags.timeout), 10) || DEFAULT_TIMEOUT_SECS)
         : DEFAULT_TIMEOUT_SECS,
-    retries: flags.retry !== undefined ? Math.max(0, parseInt(flags.retry, 10) || 0) : DEFAULT_RETRIES,
+    retries: flags.retry !== undefined ? Math.max(0, parseInt(String(flags.retry), 10) || 0) : DEFAULT_RETRIES,
     hostResolverRules: argvFlagValue(argv, 'host-resolver-rules'),
   };
 }
@@ -294,8 +286,10 @@ async function detectRenderedChallenge(context, status) {
  *
  * @param {import('crawlee').PlaywrightCrawlingContext} context
  * @param {{ type: string, blocked: boolean }} challenge
+ * @param {number} timeoutMs
  */
-async function solveRenderedChallenge(context, challenge) {
+async function solveRenderedChallenge(context, challenge, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
   const apiKey = process.env.CAPSOLVER_API_KEY;
   if (!apiKey) return false;
   const sitekey = await context.page
@@ -321,31 +315,40 @@ async function solveRenderedChallenge(context, challenge) {
   const solverUrl = process.env.CAPSOLVER_API_URL || 'https://api.capsolver.com';
   try {
     const createResponse = await context.page.request.post(`${solverUrl}/createTask`, {
+      timeout: Math.max(1, deadline - Date.now()),
       data: { clientKey: apiKey, task: { type: taskType, websiteURL: context.page.url(), websiteKey: sitekey } },
     });
     const createJson = await createResponse.json();
     if (createJson.errorId !== 0) return false;
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 40 && Date.now() < deadline; i++) {
       const resultResponse = await context.page.request.post(`${solverUrl}/getTaskResult`, {
+        timeout: Math.max(1, deadline - Date.now()),
         data: { clientKey: apiKey, taskId: createJson.taskId },
       });
       const resultJson = await resultResponse.json();
       if (resultJson.status === 'ready' && (resultJson.solution?.token ?? resultJson.solution?.gRecaptchaResponse)) {
         const token = resultJson.solution.token ?? resultJson.solution.gRecaptchaResponse;
-        await context.page.evaluate(
+        const injected = await context.page.evaluate(
           ({ selector, value }) => {
             const element = /** @type {HTMLInputElement | HTMLTextAreaElement} */ (document.querySelector(selector));
             if (element) {
               element.value = value;
               element.dispatchEvent(new Event('input', { bubbles: true }));
               element.dispatchEvent(new Event('change', { bubbles: true }));
+              return true;
             }
+            return false;
           },
           { selector: tokenSelector, value: token },
         );
-        return true;
+        if (!injected) return false;
+        while (Date.now() < deadline) {
+          if (!(await detectRenderedChallenge(context, null)).blocked) return true;
+          await context.page.waitForTimeout(100);
+        }
+        return false;
       }
-      await context.page.waitForTimeout(3000);
+      await context.page.waitForTimeout(Math.min(3000, Math.max(0, deadline - Date.now())));
     }
   } catch {
     return false;
@@ -395,6 +398,11 @@ async function buildLaunchConfig(plan) {
   if (dnsArgs.length) launchOptions.args = [...(launchOptions.args ?? []), ...dnsArgs];
   const proxy = proxyForEnv(process.env);
   if (proxy) launchOptions.proxy = proxy;
+  // Crawlee injects a local forwarding proxy even without a configured proxy.
+  // Its upstream sockets can outlive a timed-out navigation and keep the CLI
+  // alive. Direct crawls do not need that forwarding layer.
+  if (!launchOptions.proxy)
+    launchOptions.args = [...(launchOptions.args ?? []), '--no-proxy-server'];
   const { chromeUserAgent } = require('./browserProviders');
   const majorVersion = cloakbrowser.CHROMIUM_VERSION.split('.')[0];
   return { launchOptions, userAgent: chromeUserAgent(majorVersion) };
@@ -440,6 +448,9 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
       launchOptions: launchConfig.launchOptions,
       userAgent: launchConfig.userAgent,
     },
+    errorHandler: async ({ request }) => {
+      await new Promise(resolve => setTimeout(resolve, Math.min(500 * 2 ** request.retryCount, 5000)));
+    },
     requestHandler: async (context) => {
       const { request } = context;
       const depth = Number(request.userData?.depth ?? 0);
@@ -452,9 +463,8 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
       // never captured as content.
       if (plan.sameOrigin && originOf(url) !== plan.origin) return;
       let challenge = await detectRenderedChallenge(context, status);
-      if (challenge.blocked && (await solveRenderedChallenge(context, challenge))) {
-        // Token injected into the response field: trust the solved state even
-        // though the widget DOM may still be present until the site re-verifies.
+      if (challenge.blocked && (await solveRenderedChallenge(context, challenge, plan.timeoutSecs * 500))) {
+        // Success requires observing the page unblocked after token injection.
         challenge = { ...challenge, blocked: false, solved: true };
       }
       if (challenge.blocked) {
@@ -483,9 +493,13 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
         });
       } else {
         const text = await getTextContent(context);
+        const failed = (status !== null && status >= 400) || !text.trim();
+        if (((status !== null && status >= 500) || !text.trim()) && request.retryCount < plan.retries)
+          throw new Error(status !== null && status >= 500 ? `HTTP ${status}; retrying` : 'Empty body; retrying');
         const html = await context.page.content().catch(() => '');
         const record = {
           type: 'result',
+          failed,
           url,
           title,
           status,
@@ -504,7 +518,7 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
         if (schema) record.extracted = await extractBySchema(context, schema);
         state.results.push(record);
       }
-      if (plan.crawl && depth < plan.maxDepth) {
+      if (!challenge.blocked && plan.crawl && depth < plan.maxDepth) {
         const links = await getLinks(context);
         if (plan.sameOrigin) {
           // Origin boundary (scheme+host+port), stricter than hostname-only.
@@ -597,10 +611,10 @@ async function runScrape(argv) {
       failedRequests: state.failedRequests,
       durationMs: Date.now() - startedAt,
     };
-    payload.ok = state.blocked === 0 && failedCount === 0 && state.results.length > 0;
+    payload.ok = state.blocked === 0 && failedCount === 0 && state.results.length > 0 && !state.results.some(record => record.failed);
   } else if (state.results.length) {
     payload = state.results[0];
-    payload.ok = !payload.blocked && !payload.challenge?.blocked && (payload.status === null || payload.status < 400);
+    payload.ok = !payload.failed && !payload.blocked && !payload.challenge?.blocked && (payload.status === null || payload.status < 400);
   } else {
     const failed = state.failedRequests[0];
     payload = failed
@@ -611,7 +625,7 @@ async function runScrape(argv) {
           text: '',
           html: '',
           links: [],
-          challenge: { type: 'blocked', blocked: true },
+          challenge: { type: 'none', blocked: false },
           attempts: failed.attempts,
           retried: failed.attempts > 1,
           retries: failed.attempts - 1,

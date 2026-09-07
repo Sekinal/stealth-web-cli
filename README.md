@@ -273,7 +273,7 @@ stealth-web-cli scrape <url> [opts]     # render a page (or crawl) and emit stru
   --crawl                                 follow same-origin links
   --max-requests=<N>                      max pages (default 1, or 20 with --crawl)
   --max-depth=<N>                         max link depth with --crawl
-  --same-origin=true|false                only follow same-hostname links (default true)
+  --same-origin=true|false                only follow same-origin links (default true)
   --concurrency=<N> / --requests-per-minute=<N>  parallel pages / rate limit
   --select=<css>                          extract elements matching a selector
   --schema=<json-file>                    extract fields: { field: { selector, attr?, all? } }

@@ -137,7 +137,7 @@ function extendHelp(help) {
         '  --crawl                                 crawl the site following same-origin links',
         '  --max-requests=<N>                      max pages (default 1, or 20 with --crawl)',
         '  --max-depth=<N>                         max link depth to follow with --crawl',
-        '  --same-origin=true|false                only follow same-hostname links (default true)',
+        '  --same-origin=true|false                only follow same-origin links (default true)',
         '  --concurrency=<N>                       parallel pages (default 1)',
         '  --requests-per-minute=<N>               rate-limit requests per minute (default: none)',
         '  --select=<css>                          extract elements matching a selector',
@@ -224,6 +224,15 @@ function patchSession(Session, options) {
       let result = await originalRun.call(this, clientInfo, preparedArgs, runOptions);
       if (result.isError)
         process.exitCode = 1;
+      if (!result.isError && args._?.[0] === 'fetch') {
+        const parsed = normalizeUpstreamResult(parseJsonText(result.text));
+        const fetched = typeof parsed === 'object' ? parsed : parseJsonText(parseUpstreamSections(result.text).get('Result'));
+        if (fetched && typeof fetched === 'object' && 'body' in fetched && 'status' in fetched) {
+          const challenge = detectChallengeFromText(null, typeof fetched.body === 'string' ? fetched.body : '', typeof fetched.status === 'number' ? fetched.status : null);
+          if (challenge.blocked)
+            process.exitCode = 1;
+        }
+      }
       if (!result.isError && evalOutputPath) {
         rewriteEvalOutput(evalOutputPath);
         result = { ...result, text: absoluteEvalOutputLink(result.text, evalOutputPath) };
@@ -275,15 +284,20 @@ function patchSession(Session, options) {
       const cmd = args._?.[0];
       if (cmd === 'fetch' && normalizedResult && typeof normalizedResult === 'object' && !Array.isArray(normalizedResult)) {
         const fetchChallenge = detectChallengeFromText(null, typeof normalizedResult.body === 'string' ? normalizedResult.body : '', typeof normalizedResult.status === 'number' ? normalizedResult.status : null);
-        if (fetchChallenge.blocked)
+        if (fetchChallenge.blocked) {
           normalizedResult.challenge = fetchChallenge;
+          normalizedResult.failed = true;
+        }
       }
       if ((cmd === 'fetch' || cmd === 'goto') && normalizedResult && !Array.isArray(normalizedResult) && typeof normalizedResult === 'object' && normalizedResult.failed) {
+        process.exitCode = 1;
         const payload = {
           ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), fallbackDetailsForSession(this, options.env), proxyDetails(options.env)),
           ok: false,
           result: normalizedResult,
-          error: `HTTP ${normalizedResult.status} ${normalizedResult.statusText ?? ''}`.trim(),
+          error: normalizedResult.status < 400 && normalizedResult.challenge?.blocked
+            ? `Blocked by ${normalizedResult.challenge.type} challenge`
+            : `HTTP ${normalizedResult.status} ${normalizedResult.statusText ?? ''}`.trim(),
         };
         return { ...result, text: JSON.stringify(payload, null, 2) };
       }
@@ -1246,8 +1260,10 @@ async function fetchWithHttpcloak(req) {
         const options = { headers: Object.keys(req.headers).length ? req.headers : undefined };
         if (req.data !== undefined)
           options.body = req.data;
-        if (req.timeoutMs)
+        if (req.timeoutMs) {
           options.timeout = req.timeoutMs / 1000; // httpcloak timeouts are in seconds
+          options.signal = AbortSignal.timeout(req.timeoutMs);
+        }
         response = await session.request(req.method.toLowerCase(), req.url, options);
         lastError = null;
       } catch (error) {
@@ -1340,11 +1356,9 @@ async function emitEngineFetchResult(engineRequest, session, options, runOptions
       typeof engineResult.status === 'number' ? engineResult.status : null);
   if (engineChallenge.blocked) {
     engineResult.challenge = engineChallenge;
-    // The main-line (sessionless) path escalates to the browser only for
-    // JS-shell soft-blocks (2xx bodies like "Just a moment...") that a real
-    // browser can render through. Hard 4xx/5xx blocks keep the engine and
-    // surface the challenge in the result.
-    if (onEscalate && !engineResult.failed && engineRequest.engine !== 'browser') {
+    // Escalate identified challenges, including HTTP 403/429, while ordinary
+    // HTTP errors retain their original response and transport.
+    if (onEscalate && engineChallenge.type !== 'none' && engineRequest.engine !== 'browser') {
       process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH = '1';
       return { isError: false, text: '', escalate: true };
     }

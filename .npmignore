@@ -4,5 +4,6 @@
 !playwright-cli.js
 !browserProviders.js
 !cliEnhancements.js
+!scraper.js
 !skillCheck.js
 !skills/**

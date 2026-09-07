@@ -282,51 +282,47 @@ async function configForProvider(provider, state) {
     const launchOptions = await buildLaunchOptions();
     if (launchArgs.length)
       launchOptions.args = [...(launchOptions.args ?? []), ...launchArgs];
-    mergeDefaultPathConfig(launchOptions);
-    return {
+    return mergeDefaultPathConfig({
       browser: {
         browserName: 'chromium',
         launchOptions,
         contextOptions: { userAgent: ua },
       },
-    };
+    });
   }
 
   throw new Error(`Provider '${provider}' does not use a generated config.`);
 }
 
 /**
- * Merge the user's default-path CLI config (.playwright/cli.config.json) into
- * the generated provider launch options. The daemon-side resolution promotes
- * that file to a CLI-level override that otherwise shadows the provider config
- * (issue #37); here its intent (notably browser.launchOptions.proxy, the
- * documented way to set a proxy) is carried into the stealth config so both
- * the proxy AND CloakBrowser's stealth apply. A notice is emitted so silent
- * fallbacks are discoverable.
- *
- * @param {Record<string, any>} launchOptions
+ * Preserve default-path settings while keeping the provider's browser identity.
+ * @param {Record<string, any>} config
  */
-function mergeDefaultPathConfig(launchOptions) {
+function mergeDefaultPathConfig(config) {
   const defaultPath = path.join(process.cwd(), '.playwright', 'cli.config.json');
-  if (!fs.existsSync(defaultPath)) return;
+  if (!fs.existsSync(defaultPath)) return config;
   let user;
   try {
     user = JSON.parse(fs.readFileSync(defaultPath, 'utf8'));
-  } catch (error) {
-    writeProviderNotice(process.stderr, `Ignoring unparsable ${path.relative(process.cwd(), defaultPath)} (${formatProviderError(error)}).`);
-    return;
+  } catch {
+    throw new Error(`Unable to parse ${defaultPath}: expected valid JSON.`);
   }
-  const userLaunch = user?.browser?.launchOptions;
-  if (!userLaunch) return;
-  // Only merge settings the provider does not own (proxy, TTL, etc.); the
-  // provider keeps executablePath/fingerprint args so stealth is preserved.
-  const owned = new Set(['executablePath', 'args', 'headless', 'channel']);
-  for (const [key, value] of Object.entries(userLaunch)) {
-    if (owned.has(key) || value === undefined) continue;
-    if (key === 'proxy' && launchOptions.proxy) continue;
-    launchOptions[key] = value;
-  }
-  writeProviderNotice(process.stderr, `Merged ${path.relative(process.cwd(), defaultPath)} into the CloakBrowser config (provider '${providerEnvName}' active).`);
+  if (!user || typeof user !== 'object' || Array.isArray(user))
+    throw new Error(`Invalid ${defaultPath}: expected a config object.`);
+  const userLaunch = { ...user.browser?.launchOptions };
+  for (const key of ['executablePath', 'args', 'channel'])
+    delete userLaunch[key];
+  writeProviderNotice(process.stderr, `Merged ${path.relative(process.cwd(), defaultPath)} into the CloakBrowser config.`);
+  return {
+    ...user,
+    ...config,
+    browser: {
+      ...user.browser,
+      ...config.browser,
+      launchOptions: { ...userLaunch, ...config.browser.launchOptions },
+      contextOptions: { ...user.browser?.contextOptions, ...config.browser.contextOptions },
+    },
+  };
 }
 
 /**
