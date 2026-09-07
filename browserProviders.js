@@ -52,6 +52,16 @@ async function configureBrowserProviderFallbacks(options) {
   let providerIndex = await activateFirstAvailableProvider(state, env, stderr, activate);
 
   sessionClass.startDaemon = async function(/** @type {any[]} */ ...args) {
+    // Issue #37: a config file at the default path (.playwright/cli.config.json)
+    // is promoted to a CLI-level override that shadows PLAYWRIGHT_MCP_CONFIG,
+    // silently reverting the daemon to vanilla Chrome. Forward the generated
+    // provider config as an explicit --config so the daemon's CLI-level configFile
+    // (daemonOverrides) wins over the promoted default-path file instead.
+    const cliArgs = /** @type {any} */ (args?.[1]);
+    if (cliArgs && typeof cliArgs === 'object' && !cliArgs.config) {
+      const generatedConfig = env[configEnvName];
+      if (generatedConfig) cliArgs.config = generatedConfig;
+    }
     let lastError;
     while (providerIndex < state.providers.length) {
       const provider = state.providers[providerIndex];
@@ -272,6 +282,7 @@ async function configForProvider(provider, state) {
     const launchOptions = await buildLaunchOptions();
     if (launchArgs.length)
       launchOptions.args = [...(launchOptions.args ?? []), ...launchArgs];
+    mergeDefaultPathConfig(launchOptions);
     return {
       browser: {
         browserName: 'chromium',
@@ -282,6 +293,40 @@ async function configForProvider(provider, state) {
   }
 
   throw new Error(`Provider '${provider}' does not use a generated config.`);
+}
+
+/**
+ * Merge the user's default-path CLI config (.playwright/cli.config.json) into
+ * the generated provider launch options. The daemon-side resolution promotes
+ * that file to a CLI-level override that otherwise shadows the provider config
+ * (issue #37); here its intent (notably browser.launchOptions.proxy, the
+ * documented way to set a proxy) is carried into the stealth config so both
+ * the proxy AND CloakBrowser's stealth apply. A notice is emitted so silent
+ * fallbacks are discoverable.
+ *
+ * @param {Record<string, any>} launchOptions
+ */
+function mergeDefaultPathConfig(launchOptions) {
+  const defaultPath = path.join(process.cwd(), '.playwright', 'cli.config.json');
+  if (!fs.existsSync(defaultPath)) return;
+  let user;
+  try {
+    user = JSON.parse(fs.readFileSync(defaultPath, 'utf8'));
+  } catch (error) {
+    writeProviderNotice(process.stderr, `Ignoring unparsable ${path.relative(process.cwd(), defaultPath)} (${formatProviderError(error)}).`);
+    return;
+  }
+  const userLaunch = user?.browser?.launchOptions;
+  if (!userLaunch) return;
+  // Only merge settings the provider does not own (proxy, TTL, etc.); the
+  // provider keeps executablePath/fingerprint args so stealth is preserved.
+  const owned = new Set(['executablePath', 'args', 'headless', 'channel']);
+  for (const [key, value] of Object.entries(userLaunch)) {
+    if (owned.has(key) || value === undefined) continue;
+    if (key === 'proxy' && launchOptions.proxy) continue;
+    launchOptions[key] = value;
+  }
+  writeProviderNotice(process.stderr, `Merged ${path.relative(process.cwd(), defaultPath)} into the CloakBrowser config (provider '${providerEnvName}' active).`);
 }
 
 /**

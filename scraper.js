@@ -26,6 +26,33 @@ const DEFAULT_RETRIES = 3;
 const DEFAULT_TIMEOUT_SECS = 60;
 const DEFAULT_MAX_DEPTH = 10;
 
+/**
+ * Extract the origin (protocol + host + port) of a URL, or the input as-is
+ * when it cannot be parsed.
+ * @param {string} input
+ */
+function originOf(input) {
+  try {
+    const parsed = new URL(input);
+    return parsed.origin;
+  } catch {
+    return input;
+  }
+}
+
+const SCRAPE_HELP = `playwright-cli scrape <url>               scrape rendered content on stdout or --output=<file>
+  --crawl                                 crawl the site following same-origin links
+  --max-requests=<N>                      max pages (default 1, or 20 with --crawl)
+  --max-depth=<N>                         max link depth to follow with --crawl
+  --same-origin=true|false                only follow same-origin links (default true)
+  --concurrency=<N> / --requests-per-minute=<N>
+                                          parallel pages / request rate limit
+  --select=<css> | --export=<format>      extract elements (--select) / output format (json|text|markdown|csv)
+  --schema=<json-file>                    extract fields: { field: { selector, attr?, all? } }
+  --output=<file>                         write output to a file instead of stdout
+  --timeout=<seconds> / --retry=<N>       navigation timeout / retries with backoff (default 60 / 3)`;
+
+
 const DETECT_SELECTORS = {
   turnstile: '.cf-turnstile, [data-turnstile-widget], iframe[src*="challenges.cloudflare.com"]',
   recaptcha:
@@ -41,6 +68,7 @@ function parseScrapeArgs(argv) {
   const flags = {};
   for (const arg of argv) {
     if (arg === 'scrape') continue;
+    if (arg.startsWith('-s=')) continue; // session flag, never a URL
     if (arg.startsWith('--')) {
       const eq = arg.indexOf('=');
       const key = eq === -1 ? arg.slice(2) : arg.slice(2, eq);
@@ -48,6 +76,26 @@ function parseScrapeArgs(argv) {
       continue;
     }
     positional.push(arg);
+  }
+
+  if (flags.help === true || flags.h === true) {
+    return {
+      help: true,
+      url: null,
+      crawl: false,
+      maxRequests: 1,
+      maxDepth: 0,
+      concurrency: 1,
+      requestsPerMinute: 0,
+      sameOrigin: true,
+      outputFormat: 'json',
+      outputFile: null,
+      select: null,
+      schema: null,
+      timeoutSecs: DEFAULT_TIMEOUT_SECS,
+      retries: DEFAULT_RETRIES,
+      hostResolverRules: undefined,
+    };
   }
 
   const url = positional[0];
@@ -76,6 +124,7 @@ function parseScrapeArgs(argv) {
 
   return {
     url,
+    origin: originOf(url),
     crawl,
     maxRequests,
     maxDepth,
@@ -210,6 +259,7 @@ async function getLinks(context) {
  * Detect an anti-bot challenge on the rendered page (DOM widgets + text/status).
  * @param {import('crawlee').PlaywrightCrawlingContext} context
  * @param {number | null} status
+ * @returns {Promise<{ type: string, blocked: boolean, solved?: boolean }>}
  */
 async function detectRenderedChallenge(context, status) {
   try {
@@ -231,10 +281,11 @@ async function detectRenderedChallenge(context, status) {
   const bodyText = await getTextContent(context);
   const title = await context.page.title().catch(() => '');
   const detected = detectChallengeFromText(title, bodyText, status);
+  // Only genuine challenge signals (widget, marker text, 403/429) block a
+  // page; ordinary HTTP errors (404/500...) are reported as content with a
+  // non-2xx status rather than redacted as anti-bot.
   if (detected.type !== 'none') return detected;
-  return status !== null && status >= 400
-    ? { type: `http-${status}`, blocked: true }
-    : { type: 'none', blocked: false };
+  return { type: 'none', blocked: false };
 }
 
 /**
@@ -308,16 +359,25 @@ async function solveRenderedChallenge(context, challenge) {
  */
 function proxyForEnv(env) {
   const server = env.PLAYWRIGHT_MCP_PROXY_SERVER || env.HTTPS_PROXY || env.HTTP_PROXY;
+  const bypass = env.PLAYWRIGHT_MCP_PROXY_BYPASS || env.NO_PROXY;
   if (!server) return null;
+  const bypassList = bypass
+    ? bypass
+        .split(',')
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+        .join(',')
+    : undefined;
   try {
     const parsed = new URL(server.includes('://') ? server : `http://${server}`);
     return {
       server: `${parsed.protocol}//${parsed.host}`,
+      ...(bypassList ? { bypass: bypassList } : {}),
       ...(parsed.username ? { username: decodeURIComponent(parsed.username) } : {}),
       ...(parsed.password ? { password: decodeURIComponent(parsed.password) } : {}),
     };
   } catch {
-    return { server };
+    return { server, ...(bypassList ? { bypass: bypassList } : {}) };
   }
 }
 
@@ -369,6 +429,10 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
     maxRequestRetries: plan.retries,
     maxRequestsPerMinute: plan.requestsPerMinute || undefined,
     requestHandlerTimeoutSecs: plan.timeoutSecs,
+    // Bound navigation and session rotation so --timeout=1 / --retry=0 really
+    // mean one fast attempt per URL (no unbounded Crawlee-native retries).
+    navigationTimeoutSecs: plan.timeoutSecs,
+    maxSessionRotations: plan.retries,
     // Let the challenge detector classify blocked responses (403/429) instead
     // of Crawlee failing them outright, so types and redaction stay ours.
     sessionPoolOptions: { blockedStatusCodes: [] },
@@ -383,9 +447,16 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
       const status = typeof context.response?.status === 'function' ? context.response.status() : null;
       const url = context.page.url();
       const title = await context.page.title().catch(() => '');
+      // Same-origin boundary is enforced on the *final* URL: a link that
+      // redirected to another origin (host or port) is dropped here, so it is
+      // never captured as content.
+      if (plan.sameOrigin && originOf(url) !== plan.origin) return;
       let challenge = await detectRenderedChallenge(context, status);
-      if (challenge.blocked && (await solveRenderedChallenge(context, challenge)))
-        challenge = await detectRenderedChallenge(context, status);
+      if (challenge.blocked && (await solveRenderedChallenge(context, challenge))) {
+        // Token injected into the response field: trust the solved state even
+        // though the widget DOM may still be present until the site re-verifies.
+        challenge = { ...challenge, blocked: false, solved: true };
+      }
       if (challenge.blocked) {
         if (request.retryCount < plan.retries) {
           const { RetryRequestError } = require('crawlee');
@@ -434,10 +505,16 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
         state.results.push(record);
       }
       if (plan.crawl && depth < plan.maxDepth) {
-        await context.enqueueLinks({
-          strategy: plan.sameOrigin ? EnqueueStrategy.SameHostname : EnqueueStrategy.All,
-          userData: { depth: depth + 1 },
-        });
+        const links = await getLinks(context);
+        if (plan.sameOrigin) {
+          // Origin boundary (scheme+host+port), stricter than hostname-only.
+          await context.enqueueLinks({
+            urls: links.filter((link) => originOf(link) === plan.origin),
+            userData: { depth: depth + 1 },
+          });
+        } else {
+          await context.enqueueLinks({ strategy: EnqueueStrategy.All, userData: { depth: depth + 1 } });
+        }
       }
     },
     failedRequestHandler: async ({ request }, error) => {
@@ -463,13 +540,20 @@ function formatScrape(payload, format, crawl) {
   if (format === 'json') return JSON.stringify(payload, null, 2);
   if (format === 'csv') {
     const records = crawl ? payload.results : [payload];
-    const rows = records.flatMap(
-      (record) => record.extracted ?? (record.selected ? { selected: record.selected } : {}),
-    );
+    const rows = [];
+    for (const record of records) {
+      if (record.extracted) {
+        rows.push(record.extracted);
+      } else if (record.selected) {
+        // Flatten each selected element into its own row (text/html/attrs).
+        for (const element of record.selected)
+          rows.push({ text: element.text, html: element.html, ...element.attrs });
+      }
+    }
     const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))];
     if (!columns.length) throw new Error('CSV output requires --select or --schema extraction.');
     const escape = (value) => {
-      const text = Array.isArray(value) ? value.join(' | ') : value == null ? '' : String(value);
+      const text = Array.isArray(value) ? value.join(' ') : value == null ? '' : String(value);
       return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
     };
     const lines = [columns.map(escape).join(',')];
@@ -491,6 +575,10 @@ function formatScrape(payload, format, crawl) {
  */
 async function runScrape(argv) {
   const plan = parseScrapeArgs(argv);
+  if (plan.help) {
+    console.log(SCRAPE_HELP);
+    return;
+  }
   const state = createScrapeState(plan);
   const startedAt = Date.now();
   const schema = plan.schema ? loadSchema(plan.schema) : null;

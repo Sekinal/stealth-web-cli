@@ -698,6 +698,39 @@ test('scrape renders JS content, crawls with ok, redacts challenges, and extract
   }
 });
 
+test('scrape parses --help, ignores -s= session flags, and flattens CSV --select', async ({}) => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><head><title>Sel</title></head><body><h1 class="h">One</h1><p>The text</p></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+
+  try {
+    // --help and -h print the command help instead of failing on a missing URL.
+    const help = await runCli('scrape', '--help');
+    expect(help.exitCode).toBe(0);
+    expect(help.output).toContain('--max-requests');
+
+    // Scrape is sessionless: a -s=<name> flag must not be treated as the URL.
+    const scraped = await runCli('-s=scrape-cli-test', 'scrape', `${base}/`, '--select=.h', '--output-format=csv');
+    expect(scraped.exitCode).toBe(0);
+    const lines = scraped.output.trim().split('\n');
+    expect(lines[0].split(',')).toEqual(expect.arrayContaining(['text', 'html']));
+    expect(lines[1]).toContain('One');
+    expect(scraped.output).not.toContain('The text');
+    await runCli('-s=scrape-cli-test', 'close').catch(() => {});
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
 test('fetch supports basic auth via --user/--password', async ({}) => {
   const server = http.createServer((req, res) => {
     const auth = req.headers.authorization ?? '';
@@ -795,6 +828,93 @@ test('fetch --engine=browser requires a session and tags the result', async ({})
   expect(payload.result.engine).toBe('browser');
   expect(payload.result.body).toContain('plain-body');
   await runCli('-s=engine-browser', 'close');
+});
+
+test('fetch argv parser mimics minimist for separated option values', async () => {
+  const { parseCliArgv } = require('../cliEnhancements');
+  const { positional, flags } = parseCliArgv(
+      ['fetch', 'https://example.com/', '--method', 'POST', '--engine', 'httpcloak', '--data', '{"a":1}', '--json'],
+      'fetch',
+      new Set(['json', 'raw']));
+  expect(positional).toEqual(['https://example.com/']);
+  expect(flags).toEqual({ method: 'POST', engine: 'httpcloak', data: '{"a":1}', json: true });
+});
+
+test('fetch --engine=httpcloak sends --data as a raw body and separated flags parse', async ({}) => {
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ method: req.method, contentType: req.headers['content-type'] ?? null, body: rawBody }));
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const body = '{"a":1}';
+    // --engine httpcloak and --method POST as SEPARATE argv tokens (minimist
+    // style); --data must reach the server as the raw body, not a JSON-encoded
+    // quoted string.
+    const result = await runCli('fetch', base, '--engine', 'httpcloak', '--method', 'POST', '--data', body, '--json');
+    const payload = JSON.parse(result.output);
+    expect(payload.ok, result.output).toBe(true);
+    expect(payload.result.json.method).toBe('POST');
+    expect(payload.result.json.body).toBe(body);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('fetch 200-challenge pages never report success; default engine escalates', async ({}) => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><title>Just a moment...</title><body>Checking your browser before accessing, please enable JS.</body></html>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string')
+    throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    // Explicit engine: keep the transport, but never present the challenge as success.
+    const explicit = await runCli('fetch', base, '--engine=wreq', '--json');
+    const explicitPayload = JSON.parse(explicit.output);
+    expect(explicit.exitCode).toBe(1);
+    expect(explicitPayload.ok).toBe(false);
+    expect(explicitPayload.error).toContain('Blocked by cloudflare challenge');
+    expect(explicitPayload.result.challenge).toEqual({ type: 'cloudflare', blocked: true });
+
+    // Default engine escalates to the browser session instead of emitting a
+    // stale success. Without a session the escalated path hits the session
+    // gate; with one, the in-page browser fetch of this CORS-less localhost
+    // fixture fails closed. Either way a blocked challenge is never reported
+    // as ok and the process exits nonzero.
+    const noSession = await runCli('fetch', base, '--json');
+    expect(noSession.exitCode).not.toBe(0);
+    expect(JSON.parse(noSession.output).ok).toBe(false);
+
+    await runCli('-s=fetch-esc', 'open', 'data:text/html,<title>E</title>');
+    const def = await runCli('-s=fetch-esc', 'fetch', base, '--json');
+    const defPayload = JSON.parse(def.output);
+    expect(defPayload.ok).toBe(false);
+    expect(def.exitCode).not.toBe(0);
+    await runCli('-s=fetch-esc', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
 });
 test('wait-for waits for a selector or text to appear', async ({}) => {
   await runCli('-s=wait-for-test', 'open', 'data:text/html,<h1>Welcome</h1>');

@@ -507,8 +507,10 @@ function prepareCommandArgs(args) {
     const method = (prepared.method ?? 'GET').toUpperCase();
     if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(method))
       throw new Error(`Unsupported fetch method '${prepared.method}'. Expected one of: GET, POST, PUT, PATCH, DELETE, HEAD.`);
+    const forcedBrowser = process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH === '1';
+    delete process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH;
     const engineRaw = typeof prepared.engine === 'string' ? prepared.engine.toLowerCase() : '';
-    const engine = engineRaw === undefined || engineRaw === '' ? 'wreq' : engineRaw;
+    const engine = forcedBrowser ? 'browser' : (engineRaw === undefined || engineRaw === '' ? 'wreq' : engineRaw);
     // Plain engines (node-wreq/httpcloak) have no data:/about:/blob: transport;
     // the browser run-code handles those schemes natively.
     const resolvedEngine = /^(data|about|blob):/i.test(url) ? 'browser' : engine;
@@ -1243,9 +1245,9 @@ async function fetchWithHttpcloak(req) {
       try {
         const options = { headers: Object.keys(req.headers).length ? req.headers : undefined };
         if (req.data !== undefined)
-          options.json = req.data;
+          options.body = req.data;
         if (req.timeoutMs)
-          options.timeout = req.timeoutMs;
+          options.timeout = req.timeoutMs / 1000; // httpcloak timeouts are in seconds
         response = await session.request(req.method.toLowerCase(), req.url, options);
         lastError = null;
       } catch (error) {
@@ -1270,7 +1272,7 @@ async function fetchWithHttpcloak(req) {
   let body = response.text ?? '';
   let binary = false;
   if (isBinary) {
-    body = Buffer.from(body, 'binary').toString('base64');
+    body = Buffer.from(response.body || Buffer.alloc(0)).toString('base64');
     binary = true;
   }
   let json = null;
@@ -1317,9 +1319,11 @@ async function runEngineFetch(req) {
  * @param {any} session
  * @param {{ env: NodeJS.ProcessEnv }} options
  * @param {{ json?: boolean, raw?: boolean } | undefined} runOptions
- * @returns {Promise<{ isError: boolean, text: string }>}
+ * @param {(() => void) | undefined} [onEscalate] - when provided, a blocked
+ *   challenge is escalated to the browser instead of emitted (sessionless path).
+ * @returns {Promise<{ isError: boolean, text: string, escalate?: boolean }>}
  */
-async function emitEngineFetchResult(engineRequest, session, options, runOptions) {
+async function emitEngineFetchResult(engineRequest, session, options, runOptions, onEscalate) {
   let engineResult;
   try {
     engineResult = await runEngineFetch(engineRequest);
@@ -1329,24 +1333,35 @@ async function emitEngineFetchResult(engineRequest, session, options, runOptions
     return { isError: true, text: JSON.stringify(payload, null, 2) };
   }
   // Surface challenge classification exactly like the browser path: a blocked
-  // response is never presented as ordinary content.
+  // response is never presented as ordinary content, even at HTTP 200.
   const engineChallenge = detectChallengeFromText(
       null,
       typeof engineResult.body === 'string' ? engineResult.body : '',
       typeof engineResult.status === 'number' ? engineResult.status : null);
-  if (engineChallenge.blocked)
+  if (engineChallenge.blocked) {
     engineResult.challenge = engineChallenge;
+    // The main-line (sessionless) path escalates to the browser only for
+    // JS-shell soft-blocks (2xx bodies like "Just a moment...") that a real
+    // browser can render through. Hard 4xx/5xx blocks keep the engine and
+    // surface the challenge in the result.
+    if (onEscalate && !engineResult.failed && engineRequest.engine !== 'browser') {
+      process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH = '1';
+      return { isError: false, text: '', escalate: true };
+    }
+  }
+  const ok = !engineResult.failed && !engineChallenge.blocked;
   if (!runOptions?.json) {
-    if (engineResult.failed)
+    if (!ok)
       process.exitCode = 1;
     return { isError: false, text: runOptions?.raw && !engineResult.binary ? engineResult.body : JSON.stringify(engineResult, null, 2) };
   }
-  if (engineResult.failed)
+  if (!ok)
     process.exitCode = 1;
   return { isError: false, text: JSON.stringify({
     ...successPayload(null, engineResult, [], providerDetailsForSession(session, options.env), fallbackDetailsForSession(session, options.env), proxyDetails(options.env)),
-    ok: !engineResult.failed,
-    ...(engineResult.failed ? { error: `HTTP ${engineResult.status} ${engineResult.statusText ?? ''}`.trim() } : {}),
+    ok,
+    ...(!ok && engineResult.failed ? { error: `HTTP ${engineResult.status} ${engineResult.statusText ?? ''}`.trim() } : {}),
+    ...(!ok && !engineResult.failed ? { error: `Blocked by ${engineChallenge.type} challenge` } : {}),
   }, null, 2) };
 }
 
@@ -1364,38 +1379,76 @@ async function runEngineFetchFromArgv(argv, env) {
   const command = argv.find(arg => !arg.startsWith('-'));
   if (command !== 'fetch')
     return false;
-  // Build the args object the way upstream's parser would so --method=/
-  // --data=/--user=/--retry= etc. reach prepareCommandArgs as top-level keys
-  // instead of being stranded inside the positional array.
-  const positional = [];
-  const flags = /** @type {Record<string, string | boolean>} */ ({});
-  for (const arg of argv) {
-    if (arg.startsWith('-s=') || arg === 'fetch')
-      continue;
-    if (arg.startsWith('--')) {
-      const eq = arg.indexOf('=');
-      const key = eq === -1 ? arg.slice(2) : arg.slice(2, eq);
-      flags[key] = eq === -1 ? true : arg.slice(eq + 1);
-    } else if (arg.startsWith('-')) {
-      // Other tool-level flags (e.g. global output switches) are irrelevant here.
-      continue;
-    } else {
-      positional.push(arg);
-    }
-  }
+  // Build the args object the way upstream's parser (minimist) would so
+  // --method=POST, --method POST, --engine httpcloak, --data=... etc. reach
+  // prepareCommandArgs as top-level keys instead of being stranded inside the
+  // positional array.
+  const { positional, flags } = parseCliArgv(argv, 'fetch', new Set(['json', 'raw']));
   const prepared = prepareCommandArgs({ _: ['fetch', ...positional], ...flags });
   if (prepared._?.[0] !== 'engine-fetch' || !prepared._engineRequest)
     return false;
   if (prepared._engineRequest.engine === 'browser')
     return false; // needs a live session; let the daemon path handle it
-
+  // Auto escalation to the browser on challenge applies only to the default
+  // engine; an explicit --engine= (either syntax) keeps the chosen transport.
+  const explicitEngine = typeof flags.engine === 'string' && flags.engine !== '';
   const outputMode = { json: argv.includes('--json'), raw: argv.includes('--raw') };
-  const result = await emitEngineFetchResult(prepared._engineRequest, undefined, { env }, outputMode);
+  const result = await emitEngineFetchResult(
+      prepared._engineRequest,
+      undefined,
+      { env },
+      outputMode,
+      explicitEngine ? undefined : () => true);
+  if (result.escalate)
+    return false; // program() re-enters with the browser engine forced
   if (outputMode.json)
     process.stdout.write(`${result.text}\n`);
   else
     process.stdout.write(result.text);
   return true;
+}
+
+/**
+ * Parse an argv list minimist-style: `--key=value`, `--key value` (string keys
+ * consume the following token), and bare `--boolean` for keys in `booleanKeys`.
+ * Single-dash tool flags (`-s=`, `-h`) and the bare command token are skipped.
+ *
+ * @param {string[]} argv
+ * @param {string} command
+ * @param {Set<string>} booleanKeys
+ * @returns {{ positional: string[], flags: Record<string, string | boolean> }}
+ */
+function parseCliArgv(argv, command, booleanKeys) {
+  const positional = [];
+  const flags = /** @type {Record<string, string | boolean>} */ ({});
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === command || arg.startsWith('-s='))
+      continue;
+    if (arg.startsWith('--')) {
+      const eq = arg.indexOf('=');
+      if (eq !== -1) {
+        flags[arg.slice(2, eq)] = arg.slice(eq + 1);
+        continue;
+      }
+      const key = arg.slice(2);
+      if (booleanKeys.has(key)) {
+        flags[key] = true;
+        continue;
+      }
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
+      continue;
+    }
+    if (!arg.startsWith('-'))
+      positional.push(arg);
+  }
+  return { positional, flags };
 }
 
 /**
@@ -1776,6 +1829,7 @@ module.exports = {
   failurePayload,
   inferProviderDetails,
   normalizeUpstreamResult,
+  parseCliArgv,
   parseConsoleText,
   parseTimeoutMs,
   prepareCommandArgs,
