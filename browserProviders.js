@@ -12,13 +12,7 @@ const path = require('path');
 
 const providerEnvName = 'PLAYWRIGHT_CLI_BROWSER_PROVIDER';
 const activeProviderEnvName = 'PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER';
-const fallbackEnvName = 'PLAYWRIGHT_CLI_BROWSER_PROVIDER_FALLBACK';
 const configEnvName = 'PLAYWRIGHT_MCP_CONFIG';
-
-// CloakBrowser is the sole browser provider. Patchright and Camoufox were
-// removed; PLAYWRIGHT_CLI_BROWSER_PROVIDER only accepts 'cloakbrowser' now.
-const defaultProviderOrder = ['cloakbrowser'];
-const validProviders = new Set(defaultProviderOrder);
 
 /**
  * @param {{
@@ -26,11 +20,10 @@ const validProviders = new Set(defaultProviderOrder);
  *   command?: string,
  *   env?: NodeJS.ProcessEnv,
  *   sessionModule: { Session?: { startDaemon?: Function } },
- *   stderr?: NodeJS.WriteStream,
  *   activateProvider?: typeof activateProvider,
  * }} options
  */
-async function configureBrowserProviderFallbacks(options) {
+async function configureBrowserProvider(options) {
   const argv = options.argv ?? process.argv.slice(2);
   const env = options.env ?? process.env;
   const command = options.command ?? firstCommand(argv);
@@ -40,72 +33,23 @@ async function configureBrowserProviderFallbacks(options) {
 
   const sessionClass = options.sessionModule.Session;
   if (!sessionClass || typeof sessionClass.startDaemon !== 'function')
-    throw new Error('Unable to configure browser providers: Session.startDaemon was not found.');
+    throw new Error('Unable to configure CloakBrowser: Session.startDaemon was not found.');
+  const originalStartDaemon = /** @type {typeof sessionClass.startDaemon & { __cloakBrowserProvider?: boolean }} */ (sessionClass.startDaemon);
+  if (originalStartDaemon.__cloakBrowserProvider)
+    return { enabled: true };
 
-  const originalStartDaemon = /** @type {typeof sessionClass.startDaemon & { __browserProviderFallbacks?: boolean }} */ (sessionClass.startDaemon);
-  if (originalStartDaemon.__browserProviderFallbacks)
-    return { enabled: true, providers: state.providers };
-
-  const stderr = options.stderr ?? process.stderr;
-  const activate = options.activateProvider ?? activateProvider;
-  delete env[fallbackEnvName];
-  let providerIndex = await activateFirstAvailableProvider(state, env, stderr, activate);
-
+  await (options.activateProvider ?? activateProvider)(state, env);
   sessionClass.startDaemon = async function(/** @type {any[]} */ ...args) {
-    // Issue #37: a config file at the default path (.playwright/cli.config.json)
-    // is promoted to a CLI-level override that shadows PLAYWRIGHT_MCP_CONFIG,
-    // silently reverting the daemon to vanilla Chrome. Forward the generated
-    // provider config as an explicit --config so the daemon's CLI-level configFile
-    // (daemonOverrides) wins over the promoted default-path file instead.
-    const cliArgs = /** @type {any} */ (args?.[1]);
-    if (cliArgs && typeof cliArgs === 'object' && !cliArgs.config) {
-      const generatedConfig = env[configEnvName];
-      if (generatedConfig) cliArgs.config = generatedConfig;
-    }
-    let lastError;
-    while (providerIndex < state.providers.length) {
-      const provider = state.providers[providerIndex];
-      try {
-        return await originalStartDaemon.apply(this, args);
-      } catch (error) {
-        lastError = error;
-        const existingFallback = readProviderFallback(env);
-        const failures = [
-          ...(existingFallback?.reason ? [existingFallback.reason] : []),
-          `${provider}: ${formatProviderError(error)}`,
-        ];
-        providerIndex++;
-        let activated = false;
-        const nextProvider = state.providers[providerIndex];
-        if (nextProvider)
-          writeProviderNotice(stderr, `Browser provider '${provider}' failed (${formatProviderError(error)}); falling back to '${nextProvider}'.`);
-        while (providerIndex < state.providers.length) {
-          const candidate = state.providers[providerIndex];
-          try {
-            await activate(state, candidate, env);
-            setProviderFallback(env, existingFallback?.requested ?? state.providers[0], candidate, failures);
-            activated = true;
-            break;
-          } catch (activationError) {
-            lastError = activationError;
-            failures.push(`${candidate}: ${formatProviderError(activationError)}`);
-            const followingProvider = state.providers[providerIndex + 1];
-            if (followingProvider)
-              writeProviderNotice(stderr, `Browser provider '${candidate}' is unavailable (${formatProviderError(activationError)}); falling back to '${followingProvider}'.`);
-            providerIndex++;
-          }
-        }
-        if (!activated)
-          break;
-      }
-    }
-    throw lastError;
+    // An explicit generated config prevents the default-path config from
+    // overriding the CloakBrowser executable in the daemon (issue #37).
+    const cliArgs = args[1];
+    if (cliArgs && !cliArgs.config)
+      cliArgs.config = env[configEnvName];
+    return await originalStartDaemon.apply(this, args);
   };
-  /** Marker so repeated configuration is a no-op. */
-  const taggedDaemon = /** @type {typeof sessionClass.startDaemon & { __browserProviderFallbacks?: boolean }} */ (sessionClass.startDaemon);
-  taggedDaemon.__browserProviderFallbacks = true;
-
-  return { enabled: true, providers: state.providers };
+  const taggedDaemon = /** @type {typeof sessionClass.startDaemon & { __cloakBrowserProvider?: boolean }} */ (sessionClass.startDaemon);
+  taggedDaemon.__cloakBrowserProvider = true;
+  return { enabled: true };
 }
 
 /**
@@ -114,10 +58,7 @@ async function configureBrowserProviderFallbacks(options) {
  * @param {NodeJS.ProcessEnv} env
  * @returns {{
  *   enabled: boolean,
- *   providers: string[],
- *   originalConfig?: string | undefined,
  *   configDir?: string,
- *   configPaths?: Map<string, string>,
  *   hostResolverRules?: string | undefined,
  *   dnsServers?: string | undefined,
  * }}
@@ -125,16 +66,13 @@ async function configureBrowserProviderFallbacks(options) {
 function createProviderState(command, argv, env) {
   const providerOverride = env[providerEnvName];
   if (command !== 'open')
-    return { enabled: false, providers: [] };
+    return { enabled: false };
   if (!providerOverride && hasExplicitBrowserConfig(argv, env))
-    return { enabled: false, providers: [] };
-  const providers = resolveProviderOrder(providerOverride);
+    return { enabled: false };
+  resolveProvider(providerOverride);
   return {
-    enabled: providers.length > 0,
-    providers,
-    originalConfig: env[configEnvName],
+    enabled: true,
     configDir: createConfigDir(),
-    configPaths: new Map(),
     hostResolverRules: flagValue(argv, 'host-resolver-rules'),
     dnsServers: flagValue(argv, 'dns-servers'),
   };
@@ -175,123 +113,42 @@ function createConfigDir() {
 /**
  * @param {string | undefined} providerOverride
  */
-function resolveProviderOrder(providerOverride) {
-  if (!providerOverride || providerOverride === 'auto')
-    return defaultProviderOrder;
-  const providers = providerOverride.split(',').map(provider => provider.trim()).filter(Boolean);
-  for (const provider of providers) {
-    if (provider === 'patchright' || provider === 'camoufox')
-      throw new Error(`Browser provider '${provider}' was removed. CloakBrowser is the sole browser provider.`);
-    if (!validProviders.has(provider))
-      throw new Error(`Unsupported ${providerEnvName}: ${provider}. Expected one of ${[...validProviders].join(', ')}.`);
-  }
-  return providers;
+function resolveProvider(providerOverride) {
+  if (!providerOverride || providerOverride === 'auto' || providerOverride === 'cloakbrowser')
+    return 'cloakbrowser';
+  throw new Error(`Unsupported browser provider '${providerOverride}': other providers were removed. Expected cloakbrowser.`);
 }
 
 /**
  * @param {ReturnType<typeof createProviderState>} state
  * @param {NodeJS.ProcessEnv} env
- * @param {NodeJS.WriteStream} stderr
- * @param {typeof activateProvider} activate
  */
-async function activateFirstAvailableProvider(state, env, stderr, activate = activateProvider) {
-  let lastError;
-  const failures = [];
-  for (let i = 0; i < state.providers.length; i++) {
-    try {
-      await activate(state, state.providers[i], env);
-      if (failures.length)
-        setProviderFallback(env, state.providers[0], state.providers[i], failures);
-      return i;
-    } catch (error) {
-      lastError = error;
-      failures.push(`${state.providers[i]}: ${formatProviderError(error)}`);
-      const nextProvider = state.providers[i + 1];
-      if (nextProvider)
-        writeProviderNotice(stderr, `Browser provider '${state.providers[i]}' is unavailable (${formatProviderError(error)}); falling back to '${nextProvider}'.`);
-    }
-  }
-  throw lastError;
-}
-
-/**
- * @param {NodeJS.ProcessEnv} env
- * @param {string} requested
- * @param {string} active
- * @param {string[]} reasons
- */
-function setProviderFallback(env, requested, active, reasons) {
-  env[fallbackEnvName] = JSON.stringify({ requested, active, reason: reasons.join('; ') });
-}
-
-/**
- * @param {NodeJS.ProcessEnv} env
- */
-function readProviderFallback(env) {
-  try {
-    const value = JSON.parse(env[fallbackEnvName] ?? '');
-    if (typeof value.requested === 'string' && typeof value.active === 'string' && typeof value.reason === 'string')
-      return value;
-  } catch {
-  }
-  return undefined;
-}
-
-/**
- * @param {ReturnType<typeof createProviderState>} state
- * @param {string} provider
- * @param {NodeJS.ProcessEnv} env
- */
-async function activateProvider(state, provider, env) {
-  // Once provider selection is enabled, do not let ambient upstream browser
-  // settings override its generated config inside the daemon.
+async function activateProvider(state, env) {
   delete env.PLAYWRIGHT_MCP_BROWSER;
   delete env.PLAYWRIGHT_MCP_EXECUTABLE_PATH;
-  env[activeProviderEnvName] = provider;
-  env[configEnvName] = await configPathForProvider(state, provider);
+  const config = await cloakBrowserConfig(state);
+  const configPath = path.join(state.configDir ?? createConfigDir(), 'cloakbrowser.json');
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  env[activeProviderEnvName] = 'cloakbrowser';
+  env[configEnvName] = configPath;
 }
 
 /**
  * @param {ReturnType<typeof createProviderState>} state
- * @param {string} provider
  */
-async function configPathForProvider(state, provider) {
-  const configPaths = state.configPaths ?? new Map();
-  const configDir = state.configDir ?? createConfigDir();
-  const existingPath = configPaths.get(provider);
-  if (existingPath)
-    return existingPath;
-
-  const config = await configForProvider(provider, state);
-  const configPath = path.join(configDir, `${provider}.json`);
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-  configPaths.set(provider, configPath);
-  return configPath;
-}
-
-/**
- * @param {string} provider
- * @param {ReturnType<typeof createProviderState>} [state]
- */
-async function configForProvider(provider, state) {
+async function cloakBrowserConfig(state) {
+  const { buildLaunchOptions, CHROMIUM_VERSION } = await import('cloakbrowser');
+  const launchOptions = await buildLaunchOptions();
   const launchArgs = dnsLaunchArgs(state);
-  if (provider === 'cloakbrowser') {
-    const { buildLaunchOptions, CHROMIUM_VERSION } = await import('cloakbrowser');
-    const majorVersion = CHROMIUM_VERSION.split('.')[0];
-    const ua = chromeUserAgent(majorVersion);
-    const launchOptions = await buildLaunchOptions();
-    if (launchArgs.length)
-      launchOptions.args = [...(launchOptions.args ?? []), ...launchArgs];
-    return mergeDefaultPathConfig({
-      browser: {
-        browserName: 'chromium',
-        launchOptions,
-        contextOptions: { userAgent: ua },
-      },
-    });
-  }
-
-  throw new Error(`Provider '${provider}' does not use a generated config.`);
+  if (launchArgs.length)
+    launchOptions.args = [...(launchOptions.args ?? []), ...launchArgs];
+  return mergeDefaultPathConfig({
+    browser: {
+      browserName: 'chromium',
+      launchOptions,
+      contextOptions: { userAgent: chromeUserAgent(CHROMIUM_VERSION.split('.')[0]) },
+    },
+  });
 }
 
 /**
@@ -368,14 +225,6 @@ function writeProviderNotice(stderr, message) {
 }
 
 /**
- * @param {unknown} error
- */
-function formatProviderError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.replace(/\s+/g, ' ').trim() || 'unknown error';
-}
-
-/**
  * Build a platform-appropriate Chrome User-Agent string without the "Headless"
  * marker that anti-bot systems key on. CloakBrowser's --fingerprint flag should
  * handle this, but as a safety net we set an explicit non-headless UA so the
@@ -417,31 +266,33 @@ function dnsLaunchArgs(state) {
  * @param {(packageName: string) => string} [installedVersion]
  */
 function providerVersion(provider, installedVersion = installedProviderVersion) {
-  try {
-    return installedVersion(provider);
-  } catch {
-    const packageJson = /** @type {{ dependencies?: Record<string, string>, optionalDependencies?: Record<string, string> }} */ (require('./package.json'));
-    const version = packageJson.dependencies?.[provider] ?? packageJson.optionalDependencies?.[provider];
-    if (!version)
-      throw new Error(`Unable to determine the installed or declared version of browser provider '${provider}'.`);
-    return version;
-  }
+  return installedVersion(provider);
 }
 
 /**
  * @param {string} packageName
  */
 function installedProviderVersion(packageName) {
-  return require(`${packageName}/package.json`).version;
+  // CloakBrowser exports only ESM entry points, not its package.json. Read the
+  // installed manifest from Node's package search paths instead of reporting
+  // a dependency range from our own manifest as an installed version.
+  for (const directory of require.resolve.paths(packageName) ?? []) {
+    const manifest = path.join(directory, packageName, 'package.json');
+    if (!fs.existsSync(manifest))
+      continue;
+    const installed = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+    if (installed.name !== packageName || typeof installed.version !== 'string')
+      throw new Error(`Invalid installed package manifest for '${packageName}'.`);
+    return installed.version;
+  }
+  throw new Error(`Browser provider package '${packageName}' is not installed.`);
 }
 
 module.exports = {
-  configureBrowserProviderFallbacks,
+  configureBrowserProvider,
   chromeUserAgent,
   createProviderState,
-  resolveProviderOrder,
+  resolveProvider,
   hasExplicitBrowserConfig,
-  formatProviderError,
   providerVersion,
-  readProviderFallback,
 };

@@ -20,15 +20,15 @@
 const fs = require('fs');
 const path = require('path');
 
-const { program } = require('patchright-core/lib/tools/cli-client/program');
-const patchrightRoot = path.dirname(require.resolve('patchright-core/package.json'));
-const sessionModule = require(path.join(patchrightRoot, 'lib/tools/cli-client/session.js'));
-const outputModule = require(path.join(patchrightRoot, 'lib/tools/cli-client/output.js'));
-const help = require(path.join(patchrightRoot, 'lib/tools/cli-client/help.json'));
-const coreBundle = require('patchright-core/lib/coreBundle');
+const { program } = require('playwright-core/lib/tools/cli-client/program');
+const playwrightRoot = path.dirname(require.resolve('playwright-core/package.json'));
+const sessionModule = require(path.join(playwrightRoot, 'lib/tools/cli-client/session.js'));
+const outputModule = require(path.join(playwrightRoot, 'lib/tools/cli-client/output.js'));
+const help = require(path.join(playwrightRoot, 'lib/tools/cli-client/help.json'));
+const coreBundle = require('playwright-core/lib/coreBundle');
 const { tools, registry } = coreBundle;
 const { checkInstalledSkills, frame } = require('./skillCheck');
-const { configureBrowserProviderFallbacks } = require('./browserProviders');
+const { configureBrowserProvider } = require('./browserProviders');
 const { configureCliEnhancements, failurePayload } = require('./cliEnhancements');
 
 const packageJson = require('./package.json');
@@ -69,7 +69,7 @@ async function main() {
     }
     return;
   }
-  const providerConfig = await configureBrowserProviderFallbacks({ command, sessionModule });
+  const providerConfig = await configureBrowserProvider({ command, sessionModule });
   configureCliEnhancements({ argv, command, providerConfig, sessionModule, outputModule, help });
   await notifyAboutUpdate(command).catch(() => {});
   await program({ embedderVersion: packageJson.version });

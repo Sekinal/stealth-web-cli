@@ -235,9 +235,8 @@ playwright-cli --raw localstorage-get theme
 For deterministic agent output, pass `--json`. Page commands return
 `{ ok, url, title, result, console, provider }`; provider-managed sessions report the active provider
 and version, while explicitly configured sessions use `null`. Failures preserve the same shape, add
-`error`, and exit nonzero. Provider fallback adds
-`fallback: { requested, active, reason }` and persists it for later session commands. Session listing
-and JSON output recover the provider from browser configuration if older sidecar metadata is absent.
+`error`, and exit nonzero. Session listing and JSON output recover CloakBrowser provenance
+from browser configuration when sidecar metadata is absent.
 `eval --output=<file>` writes raw string values without JSON escaping and returns an absolute result
 path; use `--filename=<file>` for upstream JSON serialization.
 

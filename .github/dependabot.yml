@@ -15,7 +15,6 @@ updates:
           - "@playwright/test"
           - "playwright"
           - "playwright-core"
-          - "patchright-core"
       browser-providers:
         patterns:
           - "cloakbrowser"

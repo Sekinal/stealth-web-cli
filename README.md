@@ -328,6 +328,7 @@ stealth-web-cli close                    # close the browser
 stealth-web-cli delete-data              # delete user data for default session
 ```
 
+The CLI uses standard Playwright to control CloakBrowser; no Patchright runtime is used.
 CloakBrowser is the sole browser provider; it is selected by default (set
 `PLAYWRIGHT_CLI_BROWSER_PROVIDER=cloakbrowser`, or omit it, for the same result). The `patchright`
 and `camoufox` providers were removed and are rejected with a clear error. Explicit invocation-level
