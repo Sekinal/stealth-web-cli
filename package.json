@@ -1,6 +1,6 @@
 {
   "name": "stealth-web-cli",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Stealth web automation CLI on CloakBrowser, with Crawlee scraping and wreq/httpcloak fingerprint-matched HTTP fetch engines",
   "repository": {
     "type": "git",
