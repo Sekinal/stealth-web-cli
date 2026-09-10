@@ -2025,3 +2025,55 @@ test('fetch argv parser keeps separated values that begin with a dash (issue 52)
   const longValue = parseCliArgv(['fetch', 'http://example.com/', '--data', '--json'], 'fetch', { json: true, raw: true });
   expect(longValue.flags.data).toBe(true);
 });
+
+test('browser engine returns binary bodies losslessly (issue 21)', async () => {
+  const bytes = Buffer.from([0, 255, 254, 128, 195, 40, 13, 10]);
+  const server = http.createServer((req, res) => {
+    if (req.url === '/binary') {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      return res.end(bytes);
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><title>Binary host</title><body>ok</body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    // The browser engine fetches in-page, so the session must be on the same
+    // origin as the binary target.
+    await runCli('-s=issue21', 'open', `http://127.0.0.1:${address.port}/`);
+    const result = await runCli('-s=issue21', 'fetch', `http://127.0.0.1:${address.port}/binary`, '--engine=browser', '--json');
+    const payload = JSON.parse(result.output).result;
+    expect(payload.binary).toBe(true);
+    expect(Buffer.from(payload.body, 'base64').equals(bytes)).toBe(true);
+    await runCli('-s=issue21', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('wreq --timeout bounds body consumption, not just headers (issue 39)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.flushHeaders();
+    setTimeout(() => res.end('Delayed body'), 2500);
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    const result = await runCli('fetch', `http://127.0.0.1:${address.port}/`, '--engine=wreq', '--timeout=0.3', '--retry=0', '--json');
+    // The timeout must cover body consumption: a stalled body is a failure,
+    // not a successful response that arrives late.
+    expect(result.exitCode, result.output).not.toBe(0);
+    const payload = JSON.parse(result.output);
+    expect(payload.ok).toBe(false);
+    expect(payload.result).toBeNull();
+    expect(payload.error).toContain('timed out');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

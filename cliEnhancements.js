@@ -652,12 +652,29 @@ function prepareCommandArgs(args) {
           ...(headers && Object.keys(headers).length ? { headers } : {}),
           ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
         });
+        const responseHeaders = Object.fromEntries(res.headers.entries());
+        const contentType = responseHeaders['content-type'] || '';
+        const isBinary = /octet-stream|image\\/|application\\/pdf|application\\/zip|application\\/gzip|audio\\/|video\\/|font\\//.test(contentType);
+        // Binary bodies must be read as bytes and encoded losslessly: text()
+        // UTF-8 decodes and mangles them (issue #21).
+        let body;
+        if (isBinary) {
+          const bytes = new Uint8Array(await res.arrayBuffer());
+          let latin = '';
+          const chunk = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunk)
+            latin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+          body = btoa(latin);
+        } else {
+          body = await res.text();
+        }
         return {
           status: res.status,
           statusText: res.statusText,
           url: res.url,
-          headers: Object.fromEntries(res.headers.entries()),
-          body: await res.text(),
+          headers: responseHeaders,
+          body,
+          binary: isBinary,
           redirected: res.redirected,
         };
       }, { url, method: ${JSON.stringify(method)}, data: ${JSON.stringify(data)}, headers: ${JSON.stringify(mergedHeaders)}, timeoutMs: ${timeoutMs ?? 'null'} });
@@ -677,10 +694,8 @@ function prepareCommandArgs(args) {
   const finalUrl = response.url;
   const redirected = response.redirected;
   const headers = response.headers;
-  const contentType = headers['content-type'] ?? '';
-  const isBinary = /octet-stream|image\\/|application\\/pdf|application\\/zip|application\\/gzip|audio\\/|video\\/|font\\//.test(contentType);
   const body = response.body;
-  const binary = false;
+  const binary = response.binary === true;
   let json = null;
   if (!binary) { try { json = JSON.parse(body); } catch (_) {} }
   return {
@@ -690,6 +705,7 @@ function prepareCommandArgs(args) {
     redirected,
     headers,
     body,
+    binary,
     attempts,
     retried: attempts > 1,
     durationMs: Date.now() - startedAt,
@@ -1233,9 +1249,20 @@ async function fetchWithWreq(req) {
     headers['content-type'] = 'application/json';
   const controller = new AbortController();
   const timeout = req.timeoutMs ? setTimeout(() => controller.abort(), req.timeoutMs) : null;
+  // Created before the request so an abort that fires during/after the headers
+  // is still observed by the body read (issue #39).
+  const aborted = new Promise((_, reject) => {
+    const fail = () => reject(new Error(`Request timed out after ${req.timeoutMs}ms`));
+    if (controller.signal.aborted)
+      return fail();
+    controller.signal.addEventListener('abort', fail, { once: true });
+  });
   let response = null;
   let lastError = null;
   let attempts = 0;
+  let resolvedBody = /** @type {any} */ (null);
+  let resolvedBinary = false;
+  let resolvedHeaders = /** @type {Record<string, string>} */ ({});
   try {
     for (let i = 0; i < req.maxAttempts; i++) {
       attempts = i + 1;
@@ -1259,23 +1286,29 @@ async function fetchWithWreq(req) {
         break;
       await new Promise(resolve => setTimeout(resolve, 1500));
     }
+    // Body consumption stays inside the timeout window: a stalled body must
+    // not outlive --timeout (issue #39).
+    if (response) {
+      const responseHeaders = /** @type {Record<string, string>} */ ({});
+      response.headers.forEach((value, name) => { responseHeaders[name.toLowerCase()] = value; });
+      const contentType = responseHeaders['content-type'] ?? '';
+      const isBinaryResponse = /octet-stream|image\/|application\/pdf|application\/zip|application\/gzip|audio\/|video\/|font\//.test(contentType);
+      const readBody = isBinaryResponse
+        ? response.arrayBuffer().then((/** @type {ArrayBuffer} */ buf) => ({ body: Buffer.from(buf).toString('base64'), binary: true }))
+        : response.text().then((/** @type {string} */ text) => ({ body: text, binary: false }));
+      const settled = await Promise.race([readBody, aborted]);
+      resolvedBody = settled.body;
+      resolvedBinary = settled.binary;
+      resolvedHeaders = responseHeaders;
+    }
   } finally {
     clearTimeout(timeout);
   }
   if (lastError && !response)
     throw lastError;
-  const responseHeaders = /** @type {Record<string, string>} */ ({});
-  response.headers.forEach((value, name) => { responseHeaders[name.toLowerCase()] = value; });
-  const contentType = responseHeaders['content-type'] ?? '';
-  const isBinary = /octet-stream|image\/|application\/pdf|application\/zip|application\/gzip|audio\/|video\/|font\//.test(contentType);
-  let body;
-  let binary = false;
-  if (isBinary) {
-    body = Buffer.from(await response.arrayBuffer()).toString('base64');
-    binary = true;
-  } else {
-    body = await response.text();
-  }
+  const responseHeaders = resolvedHeaders;
+  const body = resolvedBody;
+  const binary = resolvedBinary;
   let json = null;
   if (!binary) { try { json = JSON.parse(body); } catch {} }
   /** @type {{ status: any, statusText: any, url: any, redirected: boolean, headers: Record<string, string>, body: any, binary: boolean, json: any, attempts: number, retried: boolean, durationMs: number, engine: string, failed: boolean }} */
