@@ -1805,3 +1805,215 @@ test('removed provider metadata and fallback state cannot claim active provenanc
     await runCli('-s=removed-metadata', 'close');
   }
 });
+
+// --- Issue regressions (P1 review batch) -------------------------------
+
+test('fetch --help and -h print usage without dispatching a request (issue 47)', async () => {
+  let requests = 0;
+  const server = http.createServer((req, res) => {
+    requests++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    for (const flag of ['--help', '-h']) {
+      const result = await runCli('fetch', `${base}/`, '--method=POST', flag);
+      expect(result.exitCode, result.output).toBe(0);
+      expect(result.output).toContain('playwright-cli fetch <url>');
+    }
+    const noUrl = await runCli('fetch', '--help');
+    expect(noUrl.exitCode).toBe(0);
+    expect(noUrl.output).toContain('playwright-cli fetch <url>');
+    expect(requests).toBe(0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('proxy credentials are redacted in JSON output (issue 60)', async () => {
+  // A live proxy fixture: the engine routes through it, and the reported
+  // metadata must still never expose the embedded credentials.
+  const proxy = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"fixture":true}');
+  });
+  await new Promise<void>((resolve, reject) => { proxy.once('error', reject); proxy.listen(0, '127.0.0.1', resolve); });
+  const address = proxy.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    const result = await runCliWithOptions({
+      env: { PLAYWRIGHT_MCP_PROXY_SERVER: `http://test-user:TEST_ONLY_SECRET@127.0.0.1:${address.port}` },
+    }, 'fetch', 'http://example.com/', '--engine=wreq', '--json');
+    expect(result.output).not.toContain('TEST_ONLY_SECRET');
+    expect(result.error).not.toContain('TEST_ONLY_SECRET');
+    expect(JSON.parse(result.output).proxy.server).toBe(`http://127.0.0.1:${address.port}/`);
+  } finally {
+    proxy.closeAllConnections();
+    await new Promise<void>(resolve => proxy.close(() => resolve()));
+  }
+});
+
+test('benign vendor mentions and noscript notices are not challenges (issue 46)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    if (req.url === '/article')
+      return res.end('<html><title>Integration documentation</title><body><h1>DataDome integration guide</h1><p>Configure the integration.</p></body></html>');
+    res.end('<html><body><noscript>Please enable JavaScript for interactive features.</noscript><h1>Public article</h1><p>Complete readable content.</p></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    for (const path of ['/article', '/noscript']) {
+      const result = await runCli('fetch', `${base}${path}`, '--engine=wreq', '--json');
+      expect(result.exitCode, result.output).toBe(0);
+      expect(JSON.parse(result.output).ok).toBe(true);
+    }
+    const scraped = await runCli('scrape', `${base}/article`);
+    expect(JSON.parse(scraped.output).text).toContain('DataDome integration guide');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('challenge escalation never replays a POST automatically (issue 48)', async () => {
+  let posts = 0;
+  const server = http.createServer((req, res) => {
+    if (req.method === 'POST') {
+      posts++;
+      req.resume();
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<html><title>Just a moment</title><body>Checking your browser</body></html>');
+      });
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body><h1>Ready</h1></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    await runCli('-s=issue48', 'open', `http://127.0.0.1:${address.port}/`);
+    const result = await runCli('-s=issue48', 'fetch', `http://127.0.0.1:${address.port}/create`, '--method=POST', '--data={"item":"example"}', '--retry=0', '--json');
+    expect(posts, result.output).toBe(1);
+    await runCli('-s=issue48', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('HTTP engines route through the configured proxy (issue 44)', async () => {
+  const hits: string[] = [];
+  const target = http.createServer((req, res) => {
+    hits.push('target');
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"source":"target"}');
+  });
+  const proxy = http.createServer((req, res) => {
+    hits.push('proxy');
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"source":"proxy"}');
+  });
+  await new Promise<void>((resolve, reject) => { target.once('error', reject); target.listen(0, '127.0.0.1', resolve); });
+  await new Promise<void>((resolve, reject) => { proxy.once('error', reject); proxy.listen(0, '127.0.0.1', resolve); });
+  const targetAddress = target.address();
+  const proxyAddress = proxy.address();
+  if (!targetAddress || typeof targetAddress === 'string' || !proxyAddress || typeof proxyAddress === 'string')
+    throw new Error('Expected TCP server addresses');
+  const env = {
+    PLAYWRIGHT_MCP_PROXY_SERVER: `http://127.0.0.1:${proxyAddress.port}`,
+    HTTP_PROXY: '',
+    HTTPS_PROXY: '',
+    NO_PROXY: '',
+    PLAYWRIGHT_MCP_PROXY_BYPASS: '',
+  };
+  try {
+    for (const engine of ['wreq', 'httpcloak']) {
+      hits.length = 0;
+      const result = await runCliWithOptions({ env }, 'fetch', `http://127.0.0.1:${targetAddress.port}/`, `--engine=${engine}`, '--json');
+      // The target must never be reached directly; the engine must consult the
+      // proxy. httpcloak tunnels via CONNECT, so a plain fixture yields a
+      // proxy-dial error that still proves routing (and never a direct hit).
+      expect(hits, `${engine}: ${result.output}`).not.toContain('target');
+      const routed = hits.includes('proxy') || /dial_proxy|proxy/i.test(result.output);
+      expect(routed, `${engine}: ${result.output}`).toBe(true);
+      if (hits.includes('proxy'))
+        expect(JSON.parse(result.output).result.json.source).toBe('proxy');
+    }
+  } finally {
+    target.closeAllConnections();
+    proxy.closeAllConnections();
+    await new Promise<void>(resolve => target.close(() => resolve()));
+    await new Promise<void>(resolve => proxy.close(() => resolve()));
+  }
+});
+
+test('solve-captcha never leaks the CapSolver key into output (issue 49)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body><h1>No widget here</h1></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    await runCli('-s=issue49', 'open', `http://127.0.0.1:${address.port}/`);
+    for (const args of [['solve-captcha'], ['solve-captcha', '--json']]) {
+      const result = await runCliWithOptions({ env: { CAPSOLVER_API_KEY: 'TEST_ONLY_SENTINEL_KEY' } }, '-s=issue49', ...args);
+      expect(result.output).not.toContain('TEST_ONLY_SENTINEL_KEY');
+      expect(result.error).not.toContain('TEST_ONLY_SENTINEL_KEY');
+    }
+    const flagged = await runCliWithOptions({ env: {} }, '-s=issue49', 'solve-captcha', '--captcha-api-key=TEST_ONLY_FLAG_KEY');
+    expect(flagged.output).not.toContain('TEST_ONLY_FLAG_KEY');
+    expect(flagged.error).not.toContain('TEST_ONLY_FLAG_KEY');
+    await runCli('-s=issue49', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('user agent matches the CloakBrowser fingerprint platform (issue 56)', async () => {
+  await runCli('-s=issue56', 'open', 'data:text/html,<title>UA</title>');
+  const result = await runCli('-s=issue56', 'eval', '() => ({ ua: navigator.userAgent, uaPlatform: navigator.userAgentData?.platform, platform: navigator.platform })', '--json');
+  const info = JSON.parse(result.output).result;
+  await runCli('-s=issue56', 'close');
+  // Whichever platform CloakBrowser fingerprints, the UA string must agree.
+  if (info.uaPlatform === 'Windows')
+    expect(info.ua).toContain('Windows NT');
+  else if (info.uaPlatform === 'macOS')
+    expect(info.ua).toContain('Macintosh');
+  else if (info.uaPlatform === 'Linux')
+    expect(info.ua).toContain('X11; Linux');
+  expect(info.ua).not.toContain('HeadlessChrome');
+});
+
+test('goto --timeout keeps the file: protocol restriction (issue 58)', async () => {
+  const cwd = test.info().outputPath();
+  const workspace = path.join(cwd, 'workspace');
+  fs.mkdirSync(workspace, { recursive: true });
+  const outside = path.join(cwd, 'outside.html');
+  fs.writeFileSync(outside, '<html><title>Outside</title><body>TEST_ONLY_OUTSIDE</body></html>');
+  const env = { PLAYWRIGHT_MCP_ALLOW_UNRESTRICTED_FILE_ACCESS: 'false' };
+  try {
+    await runCliWithOptions({ cwd: workspace, env }, '-s=issue58', 'open', 'data:text/html,<h1>Start</h1>');
+    const plain = await runCliWithOptions({ cwd: workspace, env }, '-s=issue58', 'goto', `file://${outside}`, '--json');
+    expect(plain.exitCode).not.toBe(0);
+    const withTimeout = await runCliWithOptions({ cwd: workspace, env }, '-s=issue58', 'goto', `file://${outside}`, '--timeout=2', '--json');
+    expect(withTimeout.exitCode, withTimeout.output).not.toBe(0);
+    expect(JSON.parse(withTimeout.output).ok).toBe(false);
+    await runCliWithOptions({ cwd: workspace, env }, '-s=issue58', 'close');
+  } finally {
+    fs.rmSync(outside, { force: true });
+  }
+});

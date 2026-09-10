@@ -12,6 +12,63 @@ const path = require('path');
 const activeProviderEnvName = 'PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER';
 const providerMetadataSuffix = '.provider.json';
 
+// Shared between the `fetch` help entry and the `fetch --help` short-circuit,
+// which must print usage instead of dispatching a request (issue #47).
+const FETCH_HELP = [
+  'playwright-cli fetch <url>               make an HTTP request (engine: wreq by default, or via the browser)',
+  '  --method=GET|POST|PUT|PATCH|DELETE|HEAD  HTTP method (default GET)',
+  '  --data=<body>                            request body (POST/PUT/PATCH)',
+  '  --header="Key: Value"                    request header (comma-separated)',
+  '  --user=<name> --password=<secret>        basic authentication',
+  '  --timeout=<seconds>                      request timeout (default: no timeout)',
+  '  --retry=<N>                              retry up to N times on 5xx/network errors',
+  '  --engine=wreq|httpcloak|browser          transport engine (default wreq; browser requires an open session)',
+].join('\n');
+
+// Secrets that must never reach stdout/stderr, generated code displays,
+// errors, or persisted logs (issue #49). Values are registered at startup and
+// when a solve-captcha invocation carries a key, then scrubbed centrally.
+const redactionSecrets = new Set();
+
+/**
+ * @param {unknown} value
+ */
+function registerSecret(value) {
+  if (typeof value === 'string' && value.length >= 6)
+    redactionSecrets.add(value);
+}
+
+/**
+ * @param {string} text
+ * @returns {string}
+ */
+function redactSecrets(text) {
+  let result = text;
+  for (const secret of redactionSecrets)
+    result = result.split(secret).join('[REDACTED]');
+  return result;
+}
+
+let secretRedactionInstalled = false;
+
+/**
+ * Wrap stdout/stderr once so any registered secret is scrubbed before it is
+ * written, regardless of the output mode or code path.
+ */
+function installSecretRedaction() {
+  if (secretRedactionInstalled)
+    return;
+  secretRedactionInstalled = true;
+  for (const stream of [process.stdout, process.stderr]) {
+    const original = stream.write.bind(stream);
+    stream.write = function(/** @type {any} */ chunk, /** @type {any[]} */ ...rest) {
+      if (typeof chunk === 'string' && redactionSecrets.size)
+        chunk = redactSecrets(chunk);
+      return original(chunk, ...rest);
+    };
+  }
+}
+
 /**
  * Adds the small amount of stealth-browser-specific behavior that cannot be
  * expressed through the upstream CLI configuration file.
@@ -32,6 +89,10 @@ function configureCliEnhancements(options) {
   const env = options.env ?? process.env;
   const command = options.command ?? firstCommand(argv);
   const stderr = options.stderr ?? process.stderr;
+
+  // Scrub secrets (CapSolver keys, proxy credentials) from every output path.
+  registerSecret(env.CAPSOLVER_API_KEY);
+  installSecretRedaction();
 
   extendHelp(options.help);
   patchSession(options.sessionModule.Session, {
@@ -90,16 +151,7 @@ function extendHelp(help) {
       flags: { method: 'string', data: 'string', header: 'string', timeout: 'string', user: 'string', password: 'string', retry: 'string', engine: 'string' },
       args: ['url'],
       raw: true,
-      help: [
-        'playwright-cli fetch <url>               make an HTTP request (engine: wreq by default, or via the browser)',
-        '  --method=GET|POST|PUT|PATCH|DELETE|HEAD  HTTP method (default GET)',
-        '  --data=<body>                            request body (POST/PUT/PATCH)',
-        '  --header="Key: Value"                    request header (comma-separated)',
-        '  --user=<name> --password=<secret>        basic authentication',
-        '  --timeout=<seconds>                      request timeout (default: no timeout)',
-        '  --retry=<N>                              retry up to N times on 5xx/network errors',
-        '  --engine=wreq|httpcloak|browser          transport engine (default wreq; browser requires an open session)',
-      ].join('\n'),
+      help: FETCH_HELP,
     };
   }
   if (!help.commands['wait-for']) {
@@ -412,6 +464,17 @@ function prepareCommandArgs(args) {
       const url = prepared._[1];
       if (typeof url !== 'string' || !url)
         throw new Error('goto requires a URL (for example, goto https://example.com --timeout=5).');
+      // Enhanced navigation must preserve the same protocol policy as plain
+      // goto; --timeout/--retry must not bypass the file: restriction (issue #58).
+      if (!process.env.PLAYWRIGHT_MCP_ALLOW_UNRESTRICTED_FILE_ACCESS || process.env.PLAYWRIGHT_MCP_ALLOW_UNRESTRICTED_FILE_ACCESS === 'false') {
+        try {
+          if (new URL(url).protocol === 'file:')
+            throw new Error(`Access to "file:" protocol is blocked. Attempted URL: "${url}"`);
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith('Access to "file:"'))
+            throw error;
+        }
+      }
       const timeoutMs = hasTimeout ? parseTimeoutMs(prepared.timeout) : 60000;
       const waitUntil = hasWaitUntil ? prepared['wait-until'] : 'domcontentloaded';
       if (hasWaitUntil && !['load', 'domcontentloaded', 'networkidle', 'commit'].includes(waitUntil))
@@ -662,6 +725,7 @@ function prepareCommandArgs(args) {
     const injectToken = prepared.token;
     const apiKey = prepared['captcha-api-key'] ?? process.env.CAPSOLVER_API_KEY;
     const useSolver = typeof apiKey === 'string' && apiKey.length > 0;
+    registerSecret(apiKey);
     delete prepared.timeout;
     delete prepared.token;
     delete prepared['captcha-api-key'];
@@ -1163,6 +1227,7 @@ async function fetchWithWreq(req) {
   const profiles = wreq.getProfiles();
   const newestChrome = profiles.filter(p => p.startsWith('chrome')).sort((a, b) => parseInt(b.split('_')[1], 10) - parseInt(a.split('_')[1], 10))[0];
   const startedAt = Date.now();
+  const proxy = proxyForEngine(req.url);
   const headers = { ...req.headers };
   if (req.data !== undefined && !Object.keys(headers).some(h => h.toLowerCase() === 'content-type'))
     headers['content-type'] = 'application/json';
@@ -1182,6 +1247,7 @@ async function fetchWithWreq(req) {
           impersonate: newestChrome,
           redirect: 'follow',
           signal: controller?.signal,
+          ...(proxy ? { proxy } : {}),
         });
         lastError = null;
       } catch (error) {
@@ -1239,7 +1305,8 @@ async function fetchWithWreq(req) {
  */
 async function fetchWithHttpcloak(req) {
   const { Session } = require('httpcloak');
-  const session = new Session({ preset: 'chrome-latest' });
+  const proxy = proxyForEngine(req.url);
+  const session = new Session({ preset: 'chrome-latest', ...(proxy ? { proxy } : {}) });
   const startedAt = Date.now();
   let response = null;
   let lastError = null;
@@ -1347,11 +1414,17 @@ async function emitEngineFetchResult(engineRequest, session, options, runOptions
       typeof engineResult.status === 'number' ? engineResult.status : null);
   if (engineChallenge.blocked) {
     engineResult.challenge = engineChallenge;
-    // Escalate identified challenges, including HTTP 403/429, while ordinary
-    // HTTP errors retain their original response and transport.
+    // Escalate identified challenges, including HTTP 403/429, but never
+    // automatically replay a potentially-mutating request: a POST that already
+    // reached the server must not be sent again just because it was challenged
+    // (issue #48). Only idempotent methods escalate implicitly.
+    const idempotent = ['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE', 'TRACE'].includes(String(engineRequest.method).toUpperCase());
     if (onEscalate && engineChallenge.type !== 'none' && engineRequest.engine !== 'browser') {
-      process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH = '1';
-      return { isError: false, text: '', escalate: true };
+      if (idempotent) {
+        process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH = '1';
+        return { isError: false, text: '', escalate: true };
+      }
+      engineResult.escalationSkipped = `challenge detected on a ${String(engineRequest.method).toUpperCase()} request; not replayed automatically`;
     }
   }
   const ok = !engineResult.failed && !engineChallenge.blocked;
@@ -1384,6 +1457,12 @@ async function runEngineFetchFromArgv(argv, env) {
   const command = argv.find(arg => !arg.startsWith('-'));
   if (command !== 'fetch')
     return false;
+  // Help takes precedence over validation and dispatch: asking for usage must
+  // never execute the supplied request (issue #47).
+  if (argv.includes('--help') || argv.includes('-h')) {
+    process.stdout.write(`${FETCH_HELP}\n`);
+    return true;
+  }
   // Build the args object the way upstream's parser (minimist) would so
   // --method=POST, --method POST, --engine httpcloak, --data=... etc. reach
   // prepareCommandArgs as top-level keys instead of being stranded inside the
@@ -1442,7 +1521,9 @@ function parseCliArgv(argv, command, booleanKeys) {
         continue;
       }
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
+      // A value may legitimately start with a single dash (e.g. `--data -1`);
+      // only a following `--flag` should be treated as a new option (issue #52).
+      if (next !== undefined && !next.startsWith('--')) {
         flags[key] = next;
         i++;
       } else {
@@ -1505,15 +1586,22 @@ function hostOfUrl(url) {
  */
 function detectChallengeFromText(title, bodyText, status) {
   const lower = `${title ?? ''} ${bodyText ?? ''}`.toLowerCase();
-  if (lower.includes('just a moment') || lower.includes('checking your browser') || lower.includes('enable javascript'))
+  const has = (/** @type {string[]} */ ...needles) => needles.some(needle => lower.includes(needle));
+  // Corroborating signals for soft keywords: a public article mentioning a
+  // vendor, or a plain <noscript> notice, is not a challenge (issue #46).
+  const challengeContext = has('challenge', 'captcha', 'turnstile', 'verify', 'security check', 'cf-', 'ray id', 'protected by', 'blocked');
+  if (has('just a moment', 'checking your browser', 'performing security verification', 'ray id'))
     return { type: 'cloudflare', blocked: true };
-  if (lower.includes('performing security verification') || lower.includes('ray id'))
+  if (has('enable javascript') && challengeContext)
     return { type: 'cloudflare', blocked: true };
-  if (lower.includes('please enable js and disable any ad blocker') || lower.includes('datadome'))
+  if (has('please enable js and disable any ad blocker'))
     return { type: 'datadome', blocked: true };
-  if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been') || lower.includes("you don't have permission"))
+  // Vendor mention alone is not proof; require challenge context or a 403.
+  if (has('datadome') && (challengeContext || status === 403))
+    return { type: 'datadome', blocked: true };
+  if (has('you have been blocked', 'your access has been') || (status === 403 && has('access denied', "you don't have permission")))
     return { type: 'blocked', blocked: true };
-  if (lower.includes('select all squares') || lower.includes('i am not a robot') || lower.includes('verify you are human') || lower.includes('prove you are human') || lower.includes('complete the security check'))
+  if (has('select all squares', 'i am not a robot', 'verify you are human', 'prove you are human', 'complete the security check'))
     return { type: 'captcha', blocked: true };
   if (status === 403)
     return { type: '403', blocked: true };
@@ -1599,7 +1687,68 @@ function proxyDetails(env) {
   if (!server)
     return undefined;
   const bypass = env.PLAYWRIGHT_MCP_PROXY_BYPASS || env.NO_PROXY;
-  return bypass ? { server, bypass } : { server };
+  // Never surface embedded credentials in diagnostics (issue #60); routing
+  // still uses the raw value internally.
+  const sanitized = redactProxyCredentials(server);
+  return bypass ? { server: sanitized, bypass } : { server: sanitized };
+}
+
+/**
+ * Strip userinfo (`user:pass@`) from a proxy URL before exposing it in output.
+ * @param {string} server
+ * @returns {string}
+ */
+function redactProxyCredentials(server) {
+  try {
+    const parsed = new URL(server.includes('://') ? server : `http://${server}`);
+    if (!parsed.username && !parsed.password)
+      return server;
+    parsed.username = '';
+    parsed.password = '';
+    return parsed.toString();
+  } catch {
+    return server.replace(/\/\/[^/@]*@/, '//');
+  }
+}
+
+/**
+ * Resolve the proxy an HTTP engine should use for a URL, honoring the bypass
+ * list. Returns undefined when no proxy applies. Both wreq and httpcloak must
+ * actually route through it — the reported metadata must not claim a proxy the
+ * engine ignores (issue #44).
+ *
+ * @param {string} url
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string | undefined}
+ */
+function proxyForEngine(url, env = process.env) {
+  const server = env.PLAYWRIGHT_MCP_PROXY_SERVER || env.HTTPS_PROXY || env.HTTP_PROXY;
+  if (!server)
+    return undefined;
+  const bypass = env.PLAYWRIGHT_MCP_PROXY_BYPASS || env.NO_PROXY;
+  return bypass && isProxyBypassed(url, bypass) ? undefined : server;
+}
+
+/**
+ * @param {string} url
+ * @param {string} bypass comma-separated NO_PROXY-style list
+ * @returns {boolean}
+ */
+function isProxyBypassed(url, bypass) {
+  let host;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return bypass
+      .split(',')
+      .map(entry => entry.trim().toLowerCase())
+      .filter(Boolean)
+      .some((entry) => {
+        const suffix = entry.replace(/^\./, '');
+        return host === suffix || host.endsWith(`.${suffix}`);
+      });
 }
 
 /**

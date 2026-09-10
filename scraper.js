@@ -403,9 +403,9 @@ async function buildLaunchConfig(plan) {
   // alive. Direct crawls do not need that forwarding layer.
   if (!launchOptions.proxy)
     launchOptions.args = [...(launchOptions.args ?? []), '--no-proxy-server'];
-  const { chromeUserAgent } = require('./browserProviders');
+  const { chromeUserAgent, fingerprintPlatform } = require('./browserProviders');
   const majorVersion = cloakbrowser.CHROMIUM_VERSION.split('.')[0];
-  return { launchOptions, userAgent: chromeUserAgent(majorVersion) };
+  return { launchOptions, userAgent: chromeUserAgent(majorVersion, fingerprintPlatform(launchOptions)) };
 }
 
 /**
