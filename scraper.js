@@ -68,7 +68,7 @@ function parseScrapeArgs(argv) {
   const { parseCliArgv } = require('./cliEnhancements');
   const { positional, flags } = parseCliArgv(
       argv.map(arg => arg === '-h' ? '--help' : arg), 'scrape',
-      new Set(['help', 'crawl', 'same-origin', 'json']));
+      { help: true, crawl: true, 'same-origin': true, json: true });
 
   if (flags.help === true || flags.h === true) {
     return {

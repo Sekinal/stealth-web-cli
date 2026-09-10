@@ -1467,7 +1467,7 @@ async function runEngineFetchFromArgv(argv, env) {
   // --method=POST, --method POST, --engine httpcloak, --data=... etc. reach
   // prepareCommandArgs as top-level keys instead of being stranded inside the
   // positional array.
-  const { positional, flags } = parseCliArgv(argv, 'fetch', new Set(['json', 'raw']));
+  const { positional, flags } = parseCliArgv(argv, 'fetch', { json: true, raw: true });
   const prepared = prepareCommandArgs({ _: ['fetch', ...positional], ...flags });
   if (prepared._?.[0] !== 'engine-fetch' || !prepared._engineRequest)
     return false;
@@ -1499,7 +1499,7 @@ async function runEngineFetchFromArgv(argv, env) {
  *
  * @param {string[]} argv
  * @param {string} command
- * @param {Set<string>} booleanKeys
+ * @param {Record<string, true>} booleanKeys - static lookup of boolean flags
  * @returns {{ positional: string[], flags: Record<string, string | boolean> }}
  */
 function parseCliArgv(argv, command, booleanKeys) {
@@ -1516,7 +1516,7 @@ function parseCliArgv(argv, command, booleanKeys) {
         continue;
       }
       const key = arg.slice(2);
-      if (booleanKeys.has(key)) {
+      if (booleanKeys[key]) {
         flags[key] = true;
         continue;
       }

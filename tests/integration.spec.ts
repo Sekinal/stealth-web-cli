@@ -851,7 +851,7 @@ test('fetch argv parser mimics minimist for separated option values', async () =
   const { positional, flags } = parseCliArgv(
       ['fetch', 'https://example.com/', '--method', 'POST', '--engine', 'httpcloak', '--data', '{"a":1}', '--json'],
       'fetch',
-      new Set(['json', 'raw']));
+      { json: true, raw: true });
   expect(positional).toEqual(['https://example.com/']);
   expect(flags).toEqual({ method: 'POST', engine: 'httpcloak', data: '{"a":1}', json: true });
 });
@@ -2016,4 +2016,12 @@ test('goto --timeout keeps the file: protocol restriction (issue 58)', async () 
   } finally {
     fs.rmSync(outside, { force: true });
   }
+});
+
+test('fetch argv parser keeps separated values that begin with a dash (issue 52)', async () => {
+  const { parseCliArgv } = require('../cliEnhancements');
+  const { flags } = parseCliArgv(['fetch', 'http://example.com/', '--data', '-1', '--json'], 'fetch', { json: true, raw: true });
+  expect(flags.data).toBe('-1');
+  const longValue = parseCliArgv(['fetch', 'http://example.com/', '--data', '--json'], 'fetch', { json: true, raw: true });
+  expect(longValue.flags.data).toBe(true);
 });
