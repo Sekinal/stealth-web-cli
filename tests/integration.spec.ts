@@ -2274,14 +2274,15 @@ test('goto retry-delay treats a bare value as milliseconds (issue 71)', async ()
   const base = `http://127.0.0.1:${address.port}`;
   try {
     await runCli('-s=issue71', 'open', `${base}/`);
-    // Documented default is milliseconds: bare and `ms` must behave the same.
-    for (const delay of ['2', '2ms']) {
+    // Documented default is milliseconds: a bare 1000 and an explicit `1s`
+    // must produce the same ~1s delay. Seconds-semantics for the bare value
+    // would stall for 1000s, far past the bound below.
+    for (const delay of ['1000', '1s']) {
       const startedAt = Date.now();
-      const result = await runCli('-s=issue71', 'goto', `${base}/retry-${delay}`, '--retry=1', `--retry-delay=${delay}`, '--timeout=3', '--json');
+      const result = await runCli('-s=issue71', 'goto', `${base}/retry-${delay}`, '--retry=1', `--retry-delay=${delay}`, '--timeout=5', '--json');
       const elapsed = Date.now() - startedAt;
       expect(JSON.parse(result.output).result.attempts, `${delay}: ${result.output}`).toBe(2);
-      // Seconds-semantics would stall ~2000ms; milliseconds stays well under it.
-      expect(elapsed, `retry-delay=${delay} took ${elapsed}ms`).toBeLessThan(1500);
+      expect(elapsed, `retry-delay=${delay} took ${elapsed}ms`).toBeLessThan(5000);
     }
     await runCli('-s=issue71', 'close');
   } finally {
