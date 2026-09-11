@@ -283,6 +283,15 @@ function patchSession(Session, options) {
             process.exitCode = 1;
         }
       }
+      if (!result.isError && args._?.[0] === 'wait-for') {
+        // A wait that times out or receives a malformed selector is a command
+        // failure, not a successful presence probe (issue #70). Text mode only
+        // needs the exit code; the JSON branch below reports ok:false.
+        const parsed = normalizeUpstreamResult(parseJsonText(result.text));
+        const waited = typeof parsed === 'object' ? parsed : parseJsonText(parseUpstreamSections(result.text).get('Result'));
+        if (waited && typeof waited === 'object' && waited.found !== true)
+          process.exitCode = 1;
+      }
       if (!result.isError && evalOutputPath) {
         rewriteEvalOutput(evalOutputPath);
         result = { ...result, text: absoluteEvalOutputLink(result.text, evalOutputPath) };
@@ -337,6 +346,16 @@ function patchSession(Session, options) {
           normalizedResult.challenge = fetchChallenge;
           normalizedResult.failed = true;
         }
+      }
+      if (cmd === 'wait-for' && normalizedResult && !Array.isArray(normalizedResult) && normalizedResult.found !== true) {
+        process.exitCode = 1;
+        const payload = {
+          ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), proxyDetails(options.env)),
+          ok: false,
+          result: normalizedResult,
+          error: normalizedResult.error ?? `wait-for did not find '${normalizedResult.selector}' within the timeout`,
+        };
+        return { ...result, text: JSON.stringify(payload, null, 2) };
       }
       if ((cmd === 'fetch' || cmd === 'goto') && normalizedResult && !Array.isArray(normalizedResult) && typeof normalizedResult === 'object' && normalizedResult.failed) {
         process.exitCode = 1;
@@ -458,8 +477,8 @@ function prepareCommandArgs(args) {
     const hasWaitUntil = prepared['wait-until'] !== undefined;
     const retryEmpty = prepared['retry-empty'] === true;
     const retryCount = prepared.retry !== undefined ? Math.max(0, parseInt(prepared.retry, 10) || 0) : 0;
-    const retryDelayMs = prepared['retry-delay'] !== undefined ? parseTimeoutMs(prepared['retry-delay'])
-        : prepared['retry-empty-delay'] !== undefined ? parseTimeoutMs(prepared['retry-empty-delay']) : 1500;
+    const retryDelayMs = prepared['retry-delay'] !== undefined ? parseDelayMs(prepared['retry-delay'])
+        : prepared['retry-empty-delay'] !== undefined ? parseDelayMs(prepared['retry-empty-delay']) : 1500;
     if (hasTimeout || hasWaitUntil || retryEmpty || retryCount > 0) {
       const url = prepared._[1];
       if (typeof url !== 'string' || !url)
@@ -607,6 +626,12 @@ function prepareCommandArgs(args) {
       ...(headerArg !== undefined ? parseHeaderArg(headerArg) : {}),
       ...(authHeader ? parseHeaderArg(authHeader) : {}),
     };
+    // Consistent body defaults across transports: a body without an explicit
+    // Content-Type must not change semantics when the engine changes (issue #69).
+    // The browser's in-page fetch would otherwise label it text/plain and the
+    // HTTP engines would send none, turning accepted JSON into HTTP 415.
+    if (data !== undefined && !Object.keys(mergedHeaders).some(name => name.toLowerCase() === 'content-type'))
+      mergedHeaders['Content-Type'] = 'application/json';
     const maxAttempts = retryCount + 1;
 
     // Non-browser engines run in Node before the daemon is ever contacted;
@@ -928,6 +953,25 @@ function parseTimeoutMs(value) {
 }
 
 /**
+ * Parse a retry delay. The documented unit for retry delays is milliseconds, so
+ * a bare number means ms (`2` -> 2ms) while an explicit suffix still works
+ * (`2s` -> 2000ms, `2ms` -> 2ms). Issue #71.
+ * @param {string | number} value
+ * @returns {number}
+ */
+function parseDelayMs(value) {
+  const input = String(value).trim().toLowerCase();
+  const match = /^(\d+(?:\.\d+)?)(ms|s)?$/.exec(input);
+  if (!match)
+    throw new Error(`Invalid retry delay '${value}'. Use milliseconds (for example, --retry-delay=1500) or an 's'/'ms' suffix.`);
+  const amount = Number(match[1]);
+  const delayMs = Math.round(match[2] === 's' ? amount * 1000 : amount);
+  if (!Number.isFinite(delayMs) || delayMs < 0)
+    throw new Error(`Invalid retry delay '${value}'.`);
+  return delayMs;
+}
+
+/**
  * Every `--json` invocation needs both the page metadata and the console buffer.
  * The two reads are independent, so issue them together instead of paying two
  * sequential daemon round-trips on top of the caller's own command. Both helpers
@@ -1100,7 +1144,9 @@ function parseBodyText(text) {
  */
 function parseTabList(text) {
   const tabs = [];
-  const re = /^- (\d+):( \(current\))? \[([^\]]+)\]\(([^)]+)\)$/gm;
+  // Greedy title/URL so ordinary punctuation in page metadata (brackets in a
+  // title, parentheses in a URL) does not silently drop the tab (issue #63).
+  const re = /^- (\d+):( \(current\))? \[(.*)\]\((.*)\)\s*$/gm;
   let match;
   while ((match = re.exec(text)) !== null) {
     tabs.push({
@@ -1112,7 +1158,6 @@ function parseTabList(text) {
   }
   return { tabs };
 }
-
 /**
  * Parse console output:
  *   "Total messages: N (Errors: X, Warnings: Y)\n[ERROR] msg\n[WARNING] msg"
@@ -1992,6 +2037,7 @@ module.exports = {
   parseCliArgv,
   parseConsoleText,
   parseTimeoutMs,
+  parseTabList,
   prepareCommandArgs,
   resolveEvalOutputPath,
   runCleanup,
