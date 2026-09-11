@@ -292,6 +292,14 @@ function patchSession(Session, options) {
         if (waited && typeof waited === 'object' && waited.found !== true)
           process.exitCode = 1;
       }
+      if (!result.isError && args._?.[0] === 'solve-captcha') {
+        // Reporting success for an unsolved captcha (no response field, timeout)
+        // is wrong: propagate it as a command failure (issue #50).
+        const parsed = normalizeUpstreamResult(parseJsonText(result.text));
+        const solved = typeof parsed === 'object' ? parsed : parseJsonText(parseUpstreamSections(result.text).get('Result'));
+        if (solved && typeof solved === 'object' && solved.solved !== true)
+          process.exitCode = 1;
+      }
       if (!result.isError && evalOutputPath) {
         rewriteEvalOutput(evalOutputPath);
         result = { ...result, text: absoluteEvalOutputLink(result.text, evalOutputPath) };
@@ -315,6 +323,10 @@ function patchSession(Session, options) {
             const resultJson = sections.get('Result');
             if (resultJson) {
               const parsed = JSON.parse(resultJson);
+              // A blocked challenge is an unsuccessful goto even at HTTP 200
+              // (issue #51); --json reports ok:false via the same flag.
+              if (parsed?.failed === true)
+                process.exitCode = 1;
               if (parsed?.redirected && typeof parsed.url === 'string') {
                 const requested = typeof args._?.[1] === 'string' ? args._[1] : '';
                 console.error(`[playwright-cli] Warning: goto landed on a different host than requested. Requested: ${hostOfUrl(requested) || requested}; final URL: ${parsed.url}`);
@@ -354,6 +366,16 @@ function patchSession(Session, options) {
           ok: false,
           result: normalizedResult,
           error: normalizedResult.error ?? `wait-for did not find '${normalizedResult.selector}' within the timeout`,
+        };
+        return { ...result, text: JSON.stringify(payload, null, 2) };
+      }
+      if (cmd === 'solve-captcha' && normalizedResult && !Array.isArray(normalizedResult) && normalizedResult.solved !== true) {
+        process.exitCode = 1;
+        const payload = {
+          ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), proxyDetails(options.env)),
+          ok: false,
+          result: normalizedResult,
+          error: normalizedResult.error ?? `captcha (${normalizedResult.captcha}) was not solved within the timeout`,
         };
         return { ...result, text: JSON.stringify(payload, null, 2) };
       }
@@ -579,7 +601,10 @@ function prepareCommandArgs(args) {
     emptyBody: bodyLength === 0,
     attempts,
     retried: attempts > 1,
-    failed: status !== null && status >= 400,
+    // A detected blocked page is an unsuccessful automation outcome even at
+    // HTTP 200; successful network navigation alone does not imply accessible
+    // target content (issue #51).
+    failed: (status !== null && status >= 400) || challenge.blocked === true,
   };
 }`];
     }
@@ -791,10 +816,18 @@ function prepareCommandArgs(args) {
     : '[name*="verification"], [name*="human"], input[type="hidden"][name*="verify"]';
   const inject = ${JSON.stringify(injectToken ?? null)};
   if (inject) {
-    await page.evaluate((args) => {
+    const injected = await page.evaluate((args) => {
       const el = document.querySelector(args.sel);
-      if (el) { el.value = args.token; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+      if (!el) return false;
+      el.value = args.token;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return el.value === args.token;
     }, { sel: tokenSelector, token: inject });
+    // Without a real response field nothing was injected; reporting success
+    // would claim a solved challenge that never happened (issue #50).
+    if (!injected)
+      return { captcha: type, solved: false, injected: false, error: 'no response field matching \\'' + tokenSelector + '\\' was found to inject the token into' };
     return { captcha: type, solved: true, injected: true };
   }
   const solverKey = ${JSON.stringify(useSolver ? apiKey : null)};

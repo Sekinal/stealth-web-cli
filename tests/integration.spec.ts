@@ -2304,3 +2304,123 @@ test('tab-list parses bracketed titles and parenthesized URLs (issue 63)', async
     { index: 2, current: false, title: '', url: 'https://example.com/' },
   ]);
 });
+
+test('scrape from an image-only page succeeds on attribute extraction (issue 66)', async () => {
+  const gif = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+  let requests = 0;
+  const server = http.createServer((req, res) => {
+    if (req.url === '/gallery')
+      requests++;
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(`<html><body><img src="${gif}"></body></html>`);
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const schemaFile = path.join(test.info().outputPath(), 'image-schema.json');
+  fs.writeFileSync(schemaFile, JSON.stringify({ image: { selector: 'img', attr: 'src' } }));
+  try {
+    const result = await runCli('scrape', `http://127.0.0.1:${address.port}/gallery`, `--schema=${schemaFile}`, '--retry=1');
+    const payload = JSON.parse(result.output);
+    expect(result.exitCode, result.output).toBe(0);
+    expect(payload.ok).toBe(true);
+    expect(payload.failed).toBe(false);
+    expect(payload.extracted.image).toBe(gif);
+    expect(payload.attempts).toBe(1);
+    expect(requests, 'a valid extraction must not be retried').toBe(1);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('scrape schema fails on an invalid selector but allows a no-match selector (issue 43)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body><h1>Actual heading</h1></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  const invalid = path.join(test.info().outputPath(), 'invalid-schema.json');
+  const noMatch = path.join(test.info().outputPath(), 'nomatch-schema.json');
+  fs.writeFileSync(invalid, JSON.stringify({ heading: { selector: '[' } }));
+  fs.writeFileSync(noMatch, JSON.stringify({ heading: { selector: '#nope' } }));
+  try {
+    for (const retry of ['0', '1']) {
+      const bad = await runCli('scrape', `${base}/`, `--schema=${invalid}`, `--retry=${retry}`);
+      expect(bad.exitCode, `retry=${retry}: ${bad.output}`).not.toBe(0);
+      expect(bad.output).toContain('heading');
+    }
+    // A valid selector that matches nothing is still a successful scrape.
+    const empty = await runCli('scrape', `${base}/`, `--schema=${noMatch}`, '--retry=0');
+    const payload = JSON.parse(empty.output);
+    expect(empty.exitCode, empty.output).toBe(0);
+    expect(payload.extracted.heading).toBeNull();
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('solve-captcha token injection fails when no response field exists (issue 50)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body><div class="cf-turnstile" data-sitekey="test-only">Local unresolved widget</div></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    await runCli('-s=issue50', 'open', `http://127.0.0.1:${address.port}/`);
+    const result = await runCli('-s=issue50', 'solve-captcha', '--token=TEST_ONLY_DUMMY', '--timeout=0.1', '--json');
+    const payload = JSON.parse(result.output);
+    expect(result.exitCode, result.output).not.toBe(0);
+    expect(payload.ok).toBe(false);
+    expect(payload.result.solved).toBe(false);
+    expect(payload.result.injected).toBe(false);
+    expect(payload.error).toBeTruthy();
+    await runCli('-s=issue50', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('goto on an HTTP 200 challenge is an unsuccessful outcome (issue 51)', async () => {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/challenge') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end('<html><title>Just a moment</title><body>Checking your browser</body></html>');
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><title>Ready</title><body><h1>Ready</h1></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    await runCli('-s=issue51', 'open', `${base}/`);
+
+    const normal = await runCli('-s=issue51', 'goto', `${base}/`, '--timeout=3', '--json');
+    expect(normal.exitCode, normal.output).toBe(0);
+    expect(JSON.parse(normal.output).ok).toBe(true);
+
+    const blocked = await runCli('-s=issue51', 'goto', `${base}/challenge`, '--timeout=3', '--json');
+    const payload = JSON.parse(blocked.output);
+    expect(blocked.exitCode, blocked.output).not.toBe(0);
+    expect(payload.ok).toBe(false);
+    // HTTP 200 and the challenge detail stay available.
+    expect(payload.result.status).toBe(200);
+    expect(payload.result.challenge).toEqual({ type: 'cloudflare', blocked: true });
+
+    const blockedText = await runCli('-s=issue51', 'goto', `${base}/challenge`, '--timeout=3');
+    expect(blockedText.exitCode, `text mode: ${blockedText.output}`).not.toBe(0);
+    await runCli('-s=issue51', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

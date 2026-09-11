@@ -194,6 +194,7 @@ async function extractBySchema(context, schema, maxItems) {
   for (const [name, extractor] of Object.entries(schema)) {
     const { selector, attr, all } = extractor;
     const attrName = attr ?? null;
+    try {
     if (all) {
       const { items, total } = await context.page.$$eval(
         selector,
@@ -210,17 +211,24 @@ async function extractBySchema(context, schema, maxItems) {
       values[name] = items;
       if (total > items.length) truncated[name] = { returned: items.length, total };
     } else {
-      values[name] = await context.page
-        .$eval(
-          selector,
-          (el, opts) => {
-            if (opts.attr) return el.getAttribute(opts.attr);
-            const node = /** @type {HTMLElement} */ (el);
-            return (node.innerText ?? el.textContent ?? '').trim();
-          },
-          { attr: attrName },
-        )
-        .catch(() => null);
+      // Distinguish "no matching element" (null) from an invalid selector:
+      // $$eval throws on malformed CSS, while an empty match set yields null
+      // (issue #43). The previous $eval().catch() masked both as null.
+      const { found, value } = await context.page.$$eval(
+        selector,
+        (elements, opts) => {
+          const el = elements[0];
+          if (!el) return { found: false, value: null };
+          if (opts.attr) return { found: true, value: el.getAttribute(opts.attr) };
+          const node = /** @type {HTMLElement} */ (el);
+          return { found: true, value: (node.innerText ?? el.textContent ?? '').trim() };
+        },
+        { attr: attrName },
+      );
+      values[name] = found ? value : null;
+    }
+    } catch (error) {
+      throw new Error(`schema field '${name}' (selector ${JSON.stringify(selector)}): ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   return { values, truncated };
@@ -538,11 +546,21 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
       } else {
         const textSnapshot = await getTextSnapshot(context);
         const text = textSnapshot.text;
-        const failed = (status !== null && status >= 400) || !text.trim();
-        if (((status !== null && status >= 500) || !text.trim()) && request.retryCount < plan.retries)
-          throw new Error(status !== null && status >= 500 ? `HTTP ${status}; retrying` : 'Empty body; retrying');
         const html = await context.page.content().catch(() => '');
         const linksSnapshot = await getLinks(context, plan.maxItems);
+        // Evaluate the requested extraction before the empty-body check: an
+        // image-only page whose attributes extract successfully is a valid
+        // result, not an empty-body failure to retry (issue #66).
+        const selection = plan.select ? await selectElements(context, plan.select, plan.maxItems) : null;
+        const extraction = schema ? await extractBySchema(context, schema, plan.maxItems) : null;
+        const extractedSomething = Boolean(
+            (selection && selection.items.length > 0) ||
+            (extraction && Object.values(extraction.values).some((value) =>
+              value !== null && value !== '' && !(Array.isArray(value) && value.length === 0))));
+        const emptyBody = !text.trim();
+        const failed = (status !== null && status >= 400) || (emptyBody && !extractedSomething);
+        if (((status !== null && status >= 500) || (emptyBody && !extractedSomething)) && request.retryCount < plan.retries)
+          throw new Error(status !== null && status >= 500 ? `HTTP ${status}; retrying` : 'Empty body; retrying');
         const record = {
           type: 'result',
           failed,
@@ -567,14 +585,12 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
           truncated.text = { returned: text.length, total: textSnapshot.total };
         if (linksSnapshot.total > linksSnapshot.links.length)
           truncated.links = { returned: linksSnapshot.links.length, total: linksSnapshot.total };
-        if (plan.select) {
-          const selection = await selectElements(context, plan.select, plan.maxItems);
+        if (selection) {
           record.selected = selection.items;
           if (selection.total > selection.items.length)
             truncated.selected = { returned: selection.items.length, total: selection.total };
         }
-        if (schema) {
-          const extraction = await extractBySchema(context, schema, plan.maxItems);
+        if (extraction) {
           record.extracted = extraction.values;
           for (const [field, info] of Object.entries(extraction.truncated)) truncated[field] = info;
         }
