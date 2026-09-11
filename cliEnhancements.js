@@ -488,9 +488,13 @@ function prepareCommandArgs(args) {
     delete prepared.inline;
     delete prepared['full-page'];
     prepared._ = ['run-code', `async (page) => {
-  const buf = ${target !== undefined
-    ? `await page.locator(${JSON.stringify(target)}).screenshot()`
-    : `await page.screenshot({ ${fullPage ? 'fullPage: true' : ''} })`};
+  const target = ${JSON.stringify(target ?? null)};
+  // Snapshot refs (e2, f1e2) resolve like the upstream screenshot tool instead
+  // of being treated as CSS selectors that do not exist (issue #67).
+  const selector = target === null ? null : (/^(f\\d+)?e\\d+$/.test(target) ? 'aria-ref=' + target : target);
+  const buf = selector === null
+    ? await page.screenshot({ ${fullPage ? 'fullPage: true' : ''} })
+    : await page.locator(selector).screenshot();
   return { screenshot: buf.toString('base64'), mimeType: 'image/png' };
 }`];
   }
@@ -849,17 +853,22 @@ function prepareCommandArgs(args) {
     const taskType = type === 'turnstile' ? 'AntiTurnstileTaskProxyLess'
       : type === 'recaptcha' ? 'ReCaptchaV2TaskProxyLess'
       : 'HCaptchaTaskProxyLess';
+    // One deadline bounds task creation, every poll call and every sleep, so
+    // --timeout is honored instead of a fixed 40x3s loop (issue #55).
+    const solverDeadline = Date.now() + ${timeoutMs};
     try {
       const createResp = await page.request.post(solverUrl + '/createTask', {
         data: { clientKey: solverKey, task: { type: taskType, websiteURL: page.url(), websiteKey: sitekey } },
+        timeout: ${timeoutMs},
       });
       const createJson = await createResp.json();
       if (createJson.errorId !== 0)
         return { captcha: type, solved: false, solver: 'capsolver', error: createJson.errorDescription || createJson.errorCode };
       const taskId = createJson.taskId;
-      for (let i = 0; i < 40; i++) {
+      while (Date.now() < solverDeadline) {
         const resResp = await page.request.post(solverUrl + '/getTaskResult', {
           data: { clientKey: solverKey, taskId },
+          timeout: Math.max(1, solverDeadline - Date.now()),
         });
         const resJson = await resResp.json();
         if (resJson.errorId !== 0)
@@ -874,7 +883,9 @@ function prepareCommandArgs(args) {
             return { captcha: type, solved: true, solver: 'capsolver', token };
           }
         }
-        await page.waitForTimeout(3000);
+        const sleepMs = Math.min(3000, solverDeadline - Date.now());
+        if (sleepMs > 0)
+          await page.waitForTimeout(sleepMs);
       }
       return { captcha: type, solved: false, solver: 'capsolver', error: 'CapSolver timed out waiting for the task result' };
     } catch (e) {

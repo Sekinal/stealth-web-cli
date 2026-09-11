@@ -95,6 +95,7 @@ function parseScrapeArgs(argv) {
       timeoutSecs: DEFAULT_TIMEOUT_SECS,
       retries: DEFAULT_RETRIES,
       hostResolverRules: undefined,
+      configPath: null,
     };
   }
 
@@ -123,6 +124,12 @@ function parseScrapeArgs(argv) {
       `Unsupported --output-format '${flags['output-format']}'. Expected one of: json, text, markdown, csv.`,
     );
 
+  // An explicit --config must exist and be readable; silently ignoring it (or
+  // a malformed file) hid configuration errors (issue #57).
+  const configPath = typeof flags.config === 'string' && flags.config ? flags.config : null;
+  if (configPath && !fs.existsSync(configPath))
+    throw new Error(`Config file '${configPath}' does not exist.`);
+
   return {
     url,
     origin: originOf(url),
@@ -137,12 +144,10 @@ function parseScrapeArgs(argv) {
     outputFile: typeof flags.output === 'string' && flags.output ? flags.output : null,
     select: typeof flags.select === 'string' && flags.select ? flags.select : null,
     schema: typeof flags.schema === 'string' && flags.schema ? flags.schema : null,
-    timeoutSecs:
-      flags.timeout !== undefined
-        ? Math.max(1, parseInt(String(flags.timeout), 10) || DEFAULT_TIMEOUT_SECS)
-        : DEFAULT_TIMEOUT_SECS,
+    timeoutSecs: parseSecondsFlag(flags.timeout, '--timeout', DEFAULT_TIMEOUT_SECS),
     retries: flags.retry !== undefined ? Math.max(0, parseInt(String(flags.retry), 10) || 0) : DEFAULT_RETRIES,
     hostResolverRules: argvFlagValue(argv, 'host-resolver-rules'),
+    configPath,
   };
 }
 
@@ -158,6 +163,24 @@ function argvFlagValue(argv, flag) {
   return undefined;
 }
 
+
+/**
+ * Parse a positive number of seconds, preserving fractional values. `parseInt`
+ * turned `--timeout=0.1` into 0 and then silently fell back to the 60s default,
+ * so asking for a shorter timeout waited longer (issue #41).
+ * @param {unknown} value
+ * @param {string} flag
+ * @param {number} fallback
+ * @returns {number}
+ */
+function parseSecondsFlag(value, flag, fallback) {
+  if (value === undefined)
+    return fallback;
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0)
+    throw new Error(`Invalid ${flag} '${value}'. Use a positive number of seconds (for example, ${flag}=5).`);
+  return amount;
+}
 /**
  * @param {string} schemaFile
  */
@@ -437,8 +460,35 @@ function proxyForEnv(env) {
 }
 
 /**
+ * Load the browser configuration for a scrape: the explicit --config path, or
+ * the documented default path. Returns null when neither exists. Throws on an
+ * unreadable/invalid explicit config so it is not silently ignored (issue #57).
+ * @param {ReturnType<typeof parseScrapeArgs>} plan
+ * @returns {any}
+ */
+function loadBrowserConfig(plan) {
+  const configPath = plan.configPath ?? path.join(process.cwd(), '.playwright', 'cli.config.json');
+  if (!fs.existsSync(configPath))
+    return null;
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`Unable to parse config '${configPath}': ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!config || typeof config !== 'object' || Array.isArray(config))
+    throw new Error(`Invalid config '${configPath}': expected an object.`);
+  return config;
+}
+
+// Launch options that define the browser identity and must never be replaced by
+// user config, or config could silently disable the stealth provider.
+const CONFIG_IDENTITY_KEYS = ['executablePath', 'args', 'channel', 'headless'];
+
+/**
  * Build the CloakBrowser launch config for the crawler, carrying the stealth
- * invariants: non-Headless UA, DNS override flags and proxy details.
+ * invariants: non-Headless UA, DNS override flags and proxy details, plus the
+ * supported parts of the user's browser configuration (issue #57).
  *
  * @param {ReturnType<typeof parseScrapeArgs>} plan
  */
@@ -448,16 +498,33 @@ async function buildLaunchConfig(plan) {
   launchOptions.headless = true;
   const dnsArgs = plan.hostResolverRules ? [`--host-resolver-rules=${plan.hostResolverRules}`] : [];
   if (dnsArgs.length) launchOptions.args = [...(launchOptions.args ?? []), ...dnsArgs];
-  const proxy = proxyForEnv(process.env);
-  if (proxy) launchOptions.proxy = proxy;
+
+  const config = loadBrowserConfig(plan);
+  for (const [key, value] of Object.entries(config?.browser?.launchOptions ?? {})) {
+    if (value === undefined || CONFIG_IDENTITY_KEYS.includes(key) || key === 'proxy')
+      continue;
+    launchOptions[key] = value;
+  }
+  // Config-provided proxy is honored when the environment does not set one.
+  const envProxy = proxyForEnv(process.env);
+  if (envProxy)
+    launchOptions.proxy = envProxy;
+  else if (config?.browser?.launchOptions?.proxy)
+    launchOptions.proxy = config.browser.launchOptions.proxy;
   // Crawlee injects a local forwarding proxy even without a configured proxy.
   // Its upstream sockets can outlive a timed-out navigation and keep the CLI
   // alive. Direct crawls do not need that forwarding layer.
   if (!launchOptions.proxy)
     launchOptions.args = [...(launchOptions.args ?? []), '--no-proxy-server'];
+
   const { chromeUserAgent, fingerprintPlatform } = require('./browserProviders');
   const majorVersion = cloakbrowser.CHROMIUM_VERSION.split('.')[0];
-  return { launchOptions, userAgent: chromeUserAgent(majorVersion, fingerprintPlatform(launchOptions)) };
+  return {
+    launchOptions,
+    userAgent: chromeUserAgent(majorVersion, fingerprintPlatform(launchOptions)),
+    extraHTTPHeaders: config?.browser?.contextOptions?.extraHTTPHeaders ?? null,
+    initScripts: Array.isArray(config?.browser?.initScript) ? config.browser.initScript : [],
+  };
 }
 
 /**
@@ -470,7 +537,7 @@ function createScrapeState(plan) {
 /**
  * @param {ReturnType<typeof parseScrapeArgs>} plan
  * @param {ReturnType<typeof createScrapeState>} state
- * @param {{ launchOptions: any, userAgent: string }} launchConfig
+ * @param {{ launchOptions: any, userAgent: string, extraHTTPHeaders: Record<string, string> | null, initScripts: string[] }} launchConfig
  * @param {Record<string, { selector: string, attr?: string | undefined, all?: boolean | undefined }> | null} schema
  */
 async function buildScrapeCrawler(plan, state, launchConfig, schema) {
@@ -500,6 +567,20 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
       launchOptions: launchConfig.launchOptions,
       userAgent: launchConfig.userAgent,
     },
+    // Apply the configured context headers and init scripts before navigation,
+    // so a header-protected target behaves the same as with `open` (issue #57).
+    preNavigationHooks: [
+      async (context) => {
+        if (launchConfig.extraHTTPHeaders)
+          await context.page.setExtraHTTPHeaders(launchConfig.extraHTTPHeaders);
+        for (const script of launchConfig.initScripts) {
+          if (typeof script === 'string' && fs.existsSync(script))
+            await context.page.addInitScript({ path: path.resolve(script) });
+          else if (typeof script === 'string')
+            await context.page.addInitScript(script);
+        }
+      },
+    ],
     errorHandler: async ({ request }) => {
       await new Promise(resolve => setTimeout(resolve, Math.min(500 * 2 ** request.retryCount, 5000)));
     },

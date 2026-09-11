@@ -2477,3 +2477,125 @@ test('install --skills installs this package skill, not the upstream one (issue 
     expect(help.error).not.toContain('does not match the tool version');
   }
 });
+
+test('screenshot --inline accepts snapshot references (issue 67)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body><button style="width:200px;height:100px">Capture</button></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const target = path.join(test.info().outputPath(), 'button.png');
+  try {
+    await runCli('-s=issue67', 'open', `http://127.0.0.1:${address.port}/`);
+    const snapshot = await runCli('-s=issue67', 'snapshot', '--inline', '--json');
+    const ref = /\[ref=(e\d+)\]/.exec(snapshot.output)?.[1];
+    expect(ref, `snapshot did not expose a ref: ${snapshot.output.slice(0, 300)}`).toBeTruthy();
+
+    const inline = await runCli('-s=issue67', 'screenshot', ref!, '--inline', '--json');
+    expect(inline.exitCode, `inline: ${inline.output}`).toBe(0);
+    expect(JSON.parse(inline.output).result.mimeType).toBe('image/png');
+
+    const toFile = await runCli('-s=issue67', 'screenshot', ref!, `--filename=${target}`, '--json');
+    expect(toFile.exitCode, `filename: ${toFile.output}`).toBe(0);
+    expect(fs.existsSync(target)).toBe(true);
+    await runCli('-s=issue67', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('scrape honors the browser config and validates --config (issue 57)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    if (req.url === '/auth' && req.headers['x-fixture-access'] !== 'allowed')
+      return res.end('<html><body>Fixture credential missing</body></html>');
+    res.end('<html><body><h1>Authorized content</h1></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const cwd = test.info().outputPath();
+  fs.mkdirSync(path.join(cwd, '.playwright'), { recursive: true });
+  fs.writeFileSync(
+      path.join(cwd, '.playwright', 'cli.config.json'),
+      JSON.stringify({ browser: { contextOptions: { extraHTTPHeaders: { 'X-Fixture-Access': 'allowed' } } } }),
+  );
+  try {
+    const authorized = await runCliWithOptions({ cwd }, 'scrape', `http://127.0.0.1:${address.port}/auth`, '--retry=0');
+    const payload = JSON.parse(authorized.output);
+    expect(authorized.exitCode, authorized.output).toBe(0);
+    expect(payload.text).toContain('Authorized content');
+
+    // An explicit nonexistent config must fail loudly, not be ignored.
+    const missing = await runCliWithOptions({ cwd }, 'scrape', `http://127.0.0.1:${address.port}/`, `--config=${path.join(cwd, 'DOES_NOT_EXIST.json')}`, '--retry=0');
+    expect(missing.exitCode, missing.output).not.toBe(0);
+    expect(missing.output + missing.error).toContain('does not exist');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('solve-captcha --timeout bounds CapSolver polling (issue 55)', async () => {
+  const page = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body><div class="cf-turnstile" data-sitekey="local-test">Local widget</div><input name="cf-turnstile-response"></body></html>');
+  });
+  const solver = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/createTask')
+      return res.end(JSON.stringify({ errorId: 0, taskId: 'local-test' }));
+    // Never resolves: the CLI must stop at its own deadline.
+    res.end(JSON.stringify({ errorId: 0, status: 'processing' }));
+  });
+  await new Promise<void>((resolve, reject) => { page.once('error', reject); page.listen(0, '127.0.0.1', resolve); });
+  await new Promise<void>((resolve, reject) => { solver.once('error', reject); solver.listen(0, '127.0.0.1', resolve); });
+  const pageAddress = page.address();
+  const solverAddress = solver.address();
+  if (!pageAddress || typeof pageAddress === 'string' || !solverAddress || typeof solverAddress === 'string')
+    throw new Error('Expected TCP server addresses');
+  const env = {
+    CAPSOLVER_API_KEY: 'TEST_ONLY',
+    CAPSOLVER_API_URL: `http://127.0.0.1:${solverAddress.port}`,
+  };
+  try {
+    await runCli('-s=issue55', 'open', `http://127.0.0.1:${pageAddress.port}/`);
+    const startedAt = Date.now();
+    const result = await runCliWithOptions({ env }, '-s=issue55', 'solve-captcha', '--timeout=0.05', '--json');
+    const elapsed = Date.now() - startedAt;
+    expect(elapsed, `solver ran for ${elapsed}ms`).toBeLessThan(3000);
+    expect(result.exitCode, result.output).not.toBe(0);
+    expect(JSON.parse(result.output).result.solved).toBe(false);
+    await runCli('-s=issue55', 'close');
+  } finally {
+    page.closeAllConnections();
+    solver.closeAllConnections();
+    await new Promise<void>(resolve => page.close(() => resolve()));
+    await new Promise<void>(resolve => solver.close(() => resolve()));
+  }
+});
+
+test('scrape --timeout preserves fractional seconds (issue 41)', async () => {
+  const { parseScrapeArgs } = require('../scraper');
+  expect(parseScrapeArgs(['scrape', 'http://127.0.0.1:1/', '--timeout=0.1']).timeoutSecs).toBeCloseTo(0.1, 5);
+  expect(() => parseScrapeArgs(['scrape', 'http://127.0.0.1:1/', '--timeout=0'])).toThrow(/positive number of seconds/);
+
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    setTimeout(() => res.end('<html><body><h1>Delayed</h1></body></html>'), 2500);
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    // A sub-second bound must fail fast rather than silently become 60s.
+    const result = await runCli('scrape', `http://127.0.0.1:${address.port}/slow`, '--timeout=0.2', '--retry=0');
+    expect(result.exitCode, result.output).not.toBe(0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
