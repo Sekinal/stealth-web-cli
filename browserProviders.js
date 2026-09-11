@@ -146,7 +146,7 @@ async function cloakBrowserConfig(state) {
     browser: {
       browserName: 'chromium',
       launchOptions,
-      contextOptions: { userAgent: chromeUserAgent(CHROMIUM_VERSION.split('.')[0]) },
+      contextOptions: { userAgent: chromeUserAgent(CHROMIUM_VERSION.split('.')[0], fingerprintPlatform(launchOptions)) },
     },
   });
 }
@@ -232,18 +232,32 @@ function writeProviderNotice(stderr, message) {
  * fingerprint engine predates the UA fix.
  *
  * @param {string} majorVersion - Chrome major version (e.g. "146")
+ * @param {string} [platform] - effective fingerprint platform, or the host OS
  * @returns {string}
  */
-function chromeUserAgent(majorVersion) {
-  const platform = process.platform;
+function chromeUserAgent(majorVersion, platform = /** @type {string} */ (process.platform)) {
+  // Derive the UA platform from CloakBrowser's effective fingerprint platform
+  // when available: the host OS can contradict the browser's Win32/macOS
+  // platform signals (issue #56). `platform` accepts both fingerprint
+  // (`windows`/`macos`/`linux`) and Node (`win32`/`darwin`/`linux`) spellings.
   let platformToken;
-  if (platform === 'darwin')
-    platformToken = 'Macintosh; Intel Mac OS X 10_15_7';
-  else if (platform === 'win32')
+  if (platform === 'win32' || platform === 'windows')
     platformToken = 'Windows NT 10.0; Win64; x64';
+  else if (platform === 'darwin' || platform === 'macos')
+    platformToken = 'Macintosh; Intel Mac OS X 10_15_7';
   else
     platformToken = 'X11; Linux x86_64';
   return `Mozilla/5.0 (${platformToken}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${majorVersion}.0.0.0 Safari/537.36`;
+}
+
+/**
+ * Read the fingerprint platform CloakBrowser selected from its launch args.
+ * @param {{ args?: unknown[] } | undefined} launchOptions
+ * @returns {string | undefined}
+ */
+function fingerprintPlatform(launchOptions) {
+  const arg = (launchOptions?.args ?? []).find(candidate => typeof candidate === 'string' && candidate.startsWith('--fingerprint-platform='));
+  return typeof arg === 'string' ? arg.slice('--fingerprint-platform='.length) : undefined;
 }
 
 /**
@@ -291,6 +305,7 @@ function installedProviderVersion(packageName) {
 module.exports = {
   configureBrowserProvider,
   chromeUserAgent,
+  fingerprintPlatform,
   createProviderState,
   resolveProvider,
   hasExplicitBrowserConfig,

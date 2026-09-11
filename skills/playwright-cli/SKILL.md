@@ -246,6 +246,15 @@ CloakBrowser is the sole browser provider and is selected by default; the remove
 `PLAYWRIGHT_MCP_BROWSER` do not skip stealth selection — only the invocation-level settings above
 do. An explicit provider selection overrides upstream browser environment variables for that launch.
 
+### Known limitations
+
+- `fetch --engine=browser` runs the request inside the current tab, so it is origin-bound: a
+  cross-origin response without CORS headers cannot be read. Prefer `--engine=wreq` or
+  `--engine=httpcloak` for cross-origin targets; the CLI diagnoses the CORS case explicitly.
+- Under CloakBrowser, page console events are not delivered, so `console` reports
+  `captureUnavailable` with a hint when it has no messages; an empty list does not mean the page
+  logged nothing. Use `eval` to read application state.
+
 ```bash
 playwright-cli list --json
 playwright-cli goto https://example.com --timeout=5 --json

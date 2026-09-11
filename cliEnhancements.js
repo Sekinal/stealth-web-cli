@@ -12,6 +12,63 @@ const path = require('path');
 const activeProviderEnvName = 'PLAYWRIGHT_CLI_ACTIVE_BROWSER_PROVIDER';
 const providerMetadataSuffix = '.provider.json';
 
+// Shared between the `fetch` help entry and the `fetch --help` short-circuit,
+// which must print usage instead of dispatching a request (issue #47).
+const FETCH_HELP = [
+  'playwright-cli fetch <url>               make an HTTP request (engine: wreq by default, or via the browser)',
+  '  --method=GET|POST|PUT|PATCH|DELETE|HEAD  HTTP method (default GET)',
+  '  --data=<body>                            request body (POST/PUT/PATCH)',
+  '  --header="Key: Value"                    request header (comma-separated)',
+  '  --user=<name> --password=<secret>        basic authentication',
+  '  --timeout=<seconds>                      request timeout (default: no timeout)',
+  '  --retry=<N>                              retry up to N times on 5xx/network errors',
+  '  --engine=wreq|httpcloak|browser          transport engine (default wreq; browser requires an open session)',
+].join('\n');
+
+// Secrets that must never reach stdout/stderr, generated code displays,
+// errors, or persisted logs (issue #49). Values are registered at startup and
+// when a solve-captcha invocation carries a key, then scrubbed centrally.
+const redactionSecrets = new Set();
+
+/**
+ * @param {unknown} value
+ */
+function registerSecret(value) {
+  if (typeof value === 'string' && value.length >= 6)
+    redactionSecrets.add(value);
+}
+
+/**
+ * @param {string} text
+ * @returns {string}
+ */
+function redactSecrets(text) {
+  let result = text;
+  for (const secret of redactionSecrets)
+    result = result.split(secret).join('[REDACTED]');
+  return result;
+}
+
+let secretRedactionInstalled = false;
+
+/**
+ * Wrap stdout/stderr once so any registered secret is scrubbed before it is
+ * written, regardless of the output mode or code path.
+ */
+function installSecretRedaction() {
+  if (secretRedactionInstalled)
+    return;
+  secretRedactionInstalled = true;
+  for (const stream of [process.stdout, process.stderr]) {
+    const original = stream.write.bind(stream);
+    stream.write = function(/** @type {any} */ chunk, /** @type {any[]} */ ...rest) {
+      if (typeof chunk === 'string' && redactionSecrets.size)
+        chunk = redactSecrets(chunk);
+      return original(chunk, ...rest);
+    };
+  }
+}
+
 /**
  * Adds the small amount of stealth-browser-specific behavior that cannot be
  * expressed through the upstream CLI configuration file.
@@ -32,6 +89,10 @@ function configureCliEnhancements(options) {
   const env = options.env ?? process.env;
   const command = options.command ?? firstCommand(argv);
   const stderr = options.stderr ?? process.stderr;
+
+  // Scrub secrets (CapSolver keys, proxy credentials) from every output path.
+  registerSecret(env.CAPSOLVER_API_KEY);
+  installSecretRedaction();
 
   extendHelp(options.help);
   patchSession(options.sessionModule.Session, {
@@ -90,16 +151,7 @@ function extendHelp(help) {
       flags: { method: 'string', data: 'string', header: 'string', timeout: 'string', user: 'string', password: 'string', retry: 'string', engine: 'string' },
       args: ['url'],
       raw: true,
-      help: [
-        'playwright-cli fetch <url>               make an HTTP request (engine: wreq by default, or via the browser)',
-        '  --method=GET|POST|PUT|PATCH|DELETE|HEAD  HTTP method (default GET)',
-        '  --data=<body>                            request body (POST/PUT/PATCH)',
-        '  --header="Key: Value"                    request header (comma-separated)',
-        '  --user=<name> --password=<secret>        basic authentication',
-        '  --timeout=<seconds>                      request timeout (default: no timeout)',
-        '  --retry=<N>                              retry up to N times on 5xx/network errors',
-        '  --engine=wreq|httpcloak|browser          transport engine (default wreq; browser requires an open session)',
-      ].join('\n'),
+      help: FETCH_HELP,
     };
   }
   if (!help.commands['wait-for']) {
@@ -231,6 +283,23 @@ function patchSession(Session, options) {
             process.exitCode = 1;
         }
       }
+      if (!result.isError && args._?.[0] === 'wait-for') {
+        // A wait that times out or receives a malformed selector is a command
+        // failure, not a successful presence probe (issue #70). Text mode only
+        // needs the exit code; the JSON branch below reports ok:false.
+        const parsed = normalizeUpstreamResult(parseJsonText(result.text));
+        const waited = typeof parsed === 'object' ? parsed : parseJsonText(parseUpstreamSections(result.text).get('Result'));
+        if (waited && typeof waited === 'object' && waited.found !== true)
+          process.exitCode = 1;
+      }
+      if (!result.isError && args._?.[0] === 'solve-captcha') {
+        // Reporting success for an unsolved captcha (no response field, timeout)
+        // is wrong: propagate it as a command failure (issue #50).
+        const parsed = normalizeUpstreamResult(parseJsonText(result.text));
+        const solved = typeof parsed === 'object' ? parsed : parseJsonText(parseUpstreamSections(result.text).get('Result'));
+        if (solved && typeof solved === 'object' && solved.solved !== true)
+          process.exitCode = 1;
+      }
       if (!result.isError && evalOutputPath) {
         rewriteEvalOutput(evalOutputPath);
         result = { ...result, text: absoluteEvalOutputLink(result.text, evalOutputPath) };
@@ -254,10 +323,20 @@ function patchSession(Session, options) {
             const resultJson = sections.get('Result');
             if (resultJson) {
               const parsed = JSON.parse(resultJson);
+              // A blocked challenge is an unsuccessful goto even at HTTP 200
+              // (issue #51); --json reports ok:false via the same flag.
+              if (parsed?.failed === true)
+                process.exitCode = 1;
               if (parsed?.redirected && typeof parsed.url === 'string') {
                 const requested = typeof args._?.[1] === 'string' ? args._[1] : '';
                 console.error(`[playwright-cli] Warning: goto landed on a different host than requested. Requested: ${hostOfUrl(requested) || requested}; final URL: ${parsed.url}`);
               }
+            } else {
+              // Plain goto: no enhanced result section, so read the navigation
+              // status directly and fail the same way (issue #17).
+              const navStatus = await readNavigationStatus(originalRun, this, clientInfo);
+              if (navStatus !== null && navStatus >= 400)
+                process.exitCode = 1;
             }
           } catch {}
         }
@@ -284,6 +363,37 @@ function patchSession(Session, options) {
         if (fetchChallenge.blocked) {
           normalizedResult.challenge = fetchChallenge;
           normalizedResult.failed = true;
+        }
+      }
+      if (cmd === 'wait-for' && normalizedResult && !Array.isArray(normalizedResult) && normalizedResult.found !== true) {
+        process.exitCode = 1;
+        const payload = {
+          ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), proxyDetails(options.env)),
+          ok: false,
+          result: normalizedResult,
+          error: normalizedResult.error ?? `wait-for did not find '${normalizedResult.selector}' within the timeout`,
+        };
+        return { ...result, text: JSON.stringify(payload, null, 2) };
+      }
+      if (cmd === 'solve-captcha' && normalizedResult && !Array.isArray(normalizedResult) && normalizedResult.solved !== true) {
+        process.exitCode = 1;
+        const payload = {
+          ...successPayload(page, null, consoleEntries, providerDetailsForSession(this, options.env), proxyDetails(options.env)),
+          ok: false,
+          result: normalizedResult,
+          error: normalizedResult.error ?? `captcha (${normalizedResult.captcha}) was not solved within the timeout`,
+        };
+        return { ...result, text: JSON.stringify(payload, null, 2) };
+      }
+      // Plain goto (no navigation flags) is upstream-handled and carries no
+      // status; read it so 4xx/5xx fail consistently with the enhanced path
+      // and with the other output modes (issue #17).
+      if (cmd === 'goto' && normalizedResult && !Array.isArray(normalizedResult) && typeof normalizedResult === 'object' && normalizedResult.status === undefined) {
+        const navStatus = await readNavigationStatus(originalRun, this, clientInfo);
+        if (navStatus !== null) {
+          normalizedResult.status = navStatus;
+          if (navStatus >= 400)
+            normalizedResult.failed = true;
         }
       }
       if ((cmd === 'fetch' || cmd === 'goto') && normalizedResult && !Array.isArray(normalizedResult) && typeof normalizedResult === 'object' && normalizedResult.failed) {
@@ -395,9 +505,13 @@ function prepareCommandArgs(args) {
     delete prepared.inline;
     delete prepared['full-page'];
     prepared._ = ['run-code', `async (page) => {
-  const buf = ${target !== undefined
-    ? `await page.locator(${JSON.stringify(target)}).screenshot()`
-    : `await page.screenshot({ ${fullPage ? 'fullPage: true' : ''} })`};
+  const target = ${JSON.stringify(target ?? null)};
+  // Snapshot refs (e2, f1e2) resolve like the upstream screenshot tool instead
+  // of being treated as CSS selectors that do not exist (issue #67).
+  const selector = target === null ? null : (/^(f\\d+)?e\\d+$/.test(target) ? 'aria-ref=' + target : target);
+  const buf = selector === null
+    ? await page.screenshot({ ${fullPage ? 'fullPage: true' : ''} })
+    : await page.locator(selector).screenshot();
   return { screenshot: buf.toString('base64'), mimeType: 'image/png' };
 }`];
   }
@@ -406,12 +520,23 @@ function prepareCommandArgs(args) {
     const hasWaitUntil = prepared['wait-until'] !== undefined;
     const retryEmpty = prepared['retry-empty'] === true;
     const retryCount = prepared.retry !== undefined ? Math.max(0, parseInt(prepared.retry, 10) || 0) : 0;
-    const retryDelayMs = prepared['retry-delay'] !== undefined ? parseTimeoutMs(prepared['retry-delay'])
-        : prepared['retry-empty-delay'] !== undefined ? parseTimeoutMs(prepared['retry-empty-delay']) : 1500;
+    const retryDelayMs = prepared['retry-delay'] !== undefined ? parseDelayMs(prepared['retry-delay'])
+        : prepared['retry-empty-delay'] !== undefined ? parseDelayMs(prepared['retry-empty-delay']) : 1500;
     if (hasTimeout || hasWaitUntil || retryEmpty || retryCount > 0) {
       const url = prepared._[1];
       if (typeof url !== 'string' || !url)
         throw new Error('goto requires a URL (for example, goto https://example.com --timeout=5).');
+      // Enhanced navigation must preserve the same protocol policy as plain
+      // goto; --timeout/--retry must not bypass the file: restriction (issue #58).
+      if (!process.env.PLAYWRIGHT_MCP_ALLOW_UNRESTRICTED_FILE_ACCESS || process.env.PLAYWRIGHT_MCP_ALLOW_UNRESTRICTED_FILE_ACCESS === 'false') {
+        try {
+          if (new URL(url).protocol === 'file:')
+            throw new Error(`Access to "file:" protocol is blocked. Attempted URL: "${url}"`);
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith('Access to "file:"'))
+            throw error;
+        }
+      }
       const timeoutMs = hasTimeout ? parseTimeoutMs(prepared.timeout) : 60000;
       const waitUntil = hasWaitUntil ? prepared['wait-until'] : 'domcontentloaded';
       if (hasWaitUntil && !['load', 'domcontentloaded', 'networkidle', 'commit'].includes(waitUntil))
@@ -497,7 +622,10 @@ function prepareCommandArgs(args) {
     emptyBody: bodyLength === 0,
     attempts,
     retried: attempts > 1,
-    failed: status !== null && status >= 400,
+    // A detected blocked page is an unsuccessful automation outcome even at
+    // HTTP 200; successful network navigation alone does not imply accessible
+    // target content (issue #51).
+    failed: (status !== null && status >= 400) || challenge.blocked === true,
   };
 }`];
     }
@@ -544,6 +672,12 @@ function prepareCommandArgs(args) {
       ...(headerArg !== undefined ? parseHeaderArg(headerArg) : {}),
       ...(authHeader ? parseHeaderArg(authHeader) : {}),
     };
+    // Consistent body defaults across transports: a body without an explicit
+    // Content-Type must not change semantics when the engine changes (issue #69).
+    // The browser's in-page fetch would otherwise label it text/plain and the
+    // HTTP engines would send none, turning accepted JSON into HTTP 415.
+    if (data !== undefined && !Object.keys(mergedHeaders).some(name => name.toLowerCase() === 'content-type'))
+      mergedHeaders['Content-Type'] = 'application/json';
     const maxAttempts = retryCount + 1;
 
     // Non-browser engines run in Node before the daemon is ever contacted;
@@ -583,24 +717,64 @@ function prepareCommandArgs(args) {
       // In-page fetch: the request rides CloakBrowser's own network stack
       // (BoringSSL + Chrome h2), not the Node-side APIRequestContext.
       response = await page.evaluate(async ({ url, method, data, headers, timeoutMs }) => {
-        const res = await fetch(url, {
-          method,
-          ...(data !== undefined ? { body: data } : {}),
-          ...(headers && Object.keys(headers).length ? { headers } : {}),
-          ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
-        });
+        let res;
+        try {
+          res = await fetch(url, {
+            method,
+            ...(data !== undefined ? { body: data } : {}),
+            ...(headers && Object.keys(headers).length ? { headers } : {}),
+            ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+          });
+        } catch (error) {
+          // The in-page fetch is bound by the tab's origin policy: a cross-origin
+          // response without CORS headers is unreadable even though the server
+          // answered. Report that precisely instead of a bare "Failed to fetch"
+          // (issue #16).
+          let targetOrigin = null;
+          try { targetOrigin = new URL(url).origin; } catch {}
+          return {
+            fetchError: (error && error.message) || String(error),
+            pageOrigin: location.origin,
+            targetOrigin,
+          };
+        }
+        const responseHeaders = Object.fromEntries(res.headers.entries());
+        const contentType = responseHeaders['content-type'] || '';
+        const isBinary = /octet-stream|image\\/|application\\/pdf|application\\/zip|application\\/gzip|audio\\/|video\\/|font\\//.test(contentType);
+        // Binary bodies must be read as bytes and encoded losslessly: text()
+        // UTF-8 decodes and mangles them (issue #21).
+        let body;
+        if (isBinary) {
+          const bytes = new Uint8Array(await res.arrayBuffer());
+          let latin = '';
+          const chunk = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunk)
+            latin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+          body = btoa(latin);
+        } else {
+          body = await res.text();
+        }
         return {
           status: res.status,
           statusText: res.statusText,
           url: res.url,
-          headers: Object.fromEntries(res.headers.entries()),
-          body: await res.text(),
+          headers: responseHeaders,
+          body,
+          binary: isBinary,
           redirected: res.redirected,
         };
       }, { url, method: ${JSON.stringify(method)}, data: ${JSON.stringify(data)}, headers: ${JSON.stringify(mergedHeaders)}, timeoutMs: ${timeoutMs ?? 'null'} });
+      if (response && response.fetchError) {
+        const crossOrigin = response.targetOrigin && response.targetOrigin !== response.pageOrigin;
+        const hint = crossOrigin
+          ? ' The target is cross-origin from the session page and did not grant CORS access, so the browser refused to expose the response. Use --engine=wreq or --engine=httpcloak for cross-origin targets.'
+          : '';
+        throw new Error('Browser-engine fetch failed for ' + url + ': ' + response.fetchError + '.' + hint);
+      }
       lastError = null;
     } catch (e) {
       lastError = e;
+      response = null;
     }
     const statusNow = response ? response.status : null;
     const shouldRetry = ${retryCount} > 0 && i < ${maxAttempts} - 1 && (lastError !== null || (statusNow !== null && statusNow >= 500));
@@ -614,10 +788,8 @@ function prepareCommandArgs(args) {
   const finalUrl = response.url;
   const redirected = response.redirected;
   const headers = response.headers;
-  const contentType = headers['content-type'] ?? '';
-  const isBinary = /octet-stream|image\\/|application\\/pdf|application\\/zip|application\\/gzip|audio\\/|video\\/|font\\//.test(contentType);
   const body = response.body;
-  const binary = false;
+  const binary = response.binary === true;
   let json = null;
   if (!binary) { try { json = JSON.parse(body); } catch (_) {} }
   return {
@@ -627,6 +799,8 @@ function prepareCommandArgs(args) {
     redirected,
     headers,
     body,
+    binary,
+    json,
     attempts,
     retried: attempts > 1,
     durationMs: Date.now() - startedAt,
@@ -662,6 +836,7 @@ function prepareCommandArgs(args) {
     const injectToken = prepared.token;
     const apiKey = prepared['captcha-api-key'] ?? process.env.CAPSOLVER_API_KEY;
     const useSolver = typeof apiKey === 'string' && apiKey.length > 0;
+    registerSecret(apiKey);
     delete prepared.timeout;
     delete prepared.token;
     delete prepared['captcha-api-key'];
@@ -685,10 +860,18 @@ function prepareCommandArgs(args) {
     : '[name*="verification"], [name*="human"], input[type="hidden"][name*="verify"]';
   const inject = ${JSON.stringify(injectToken ?? null)};
   if (inject) {
-    await page.evaluate((args) => {
+    const injected = await page.evaluate((args) => {
       const el = document.querySelector(args.sel);
-      if (el) { el.value = args.token; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+      if (!el) return false;
+      el.value = args.token;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return el.value === args.token;
     }, { sel: tokenSelector, token: inject });
+    // Without a real response field nothing was injected; reporting success
+    // would claim a solved challenge that never happened (issue #50).
+    if (!injected)
+      return { captcha: type, solved: false, injected: false, error: 'no response field matching \\'' + tokenSelector + '\\' was found to inject the token into' };
     return { captcha: type, solved: true, injected: true };
   }
   const solverKey = ${JSON.stringify(useSolver ? apiKey : null)};
@@ -710,17 +893,22 @@ function prepareCommandArgs(args) {
     const taskType = type === 'turnstile' ? 'AntiTurnstileTaskProxyLess'
       : type === 'recaptcha' ? 'ReCaptchaV2TaskProxyLess'
       : 'HCaptchaTaskProxyLess';
+    // One deadline bounds task creation, every poll call and every sleep, so
+    // --timeout is honored instead of a fixed 40x3s loop (issue #55).
+    const solverDeadline = Date.now() + ${timeoutMs};
     try {
       const createResp = await page.request.post(solverUrl + '/createTask', {
         data: { clientKey: solverKey, task: { type: taskType, websiteURL: page.url(), websiteKey: sitekey } },
+        timeout: ${timeoutMs},
       });
       const createJson = await createResp.json();
       if (createJson.errorId !== 0)
         return { captcha: type, solved: false, solver: 'capsolver', error: createJson.errorDescription || createJson.errorCode };
       const taskId = createJson.taskId;
-      for (let i = 0; i < 40; i++) {
+      while (Date.now() < solverDeadline) {
         const resResp = await page.request.post(solverUrl + '/getTaskResult', {
           data: { clientKey: solverKey, taskId },
+          timeout: Math.max(1, solverDeadline - Date.now()),
         });
         const resJson = await resResp.json();
         if (resJson.errorId !== 0)
@@ -735,7 +923,9 @@ function prepareCommandArgs(args) {
             return { captcha: type, solved: true, solver: 'capsolver', token };
           }
         }
-        await page.waitForTimeout(3000);
+        const sleepMs = Math.min(3000, solverDeadline - Date.now());
+        if (sleepMs > 0)
+          await page.waitForTimeout(sleepMs);
       }
       return { captcha: type, solved: false, solver: 'capsolver', error: 'CapSolver timed out waiting for the task result' };
     } catch (e) {
@@ -847,6 +1037,25 @@ function parseTimeoutMs(value) {
 }
 
 /**
+ * Parse a retry delay. The documented unit for retry delays is milliseconds, so
+ * a bare number means ms (`2` -> 2ms) while an explicit suffix still works
+ * (`2s` -> 2000ms, `2ms` -> 2ms). Issue #71.
+ * @param {string | number} value
+ * @returns {number}
+ */
+function parseDelayMs(value) {
+  const input = String(value).trim().toLowerCase();
+  const match = /^(\d+(?:\.\d+)?)(ms|s)?$/.exec(input);
+  if (!match)
+    throw new Error(`Invalid retry delay '${value}'. Use milliseconds (for example, --retry-delay=1500) or an 's'/'ms' suffix.`);
+  const amount = Number(match[1]);
+  const delayMs = Math.round(match[2] === 's' ? amount * 1000 : amount);
+  if (!Number.isFinite(delayMs) || delayMs < 0)
+    throw new Error(`Invalid retry delay '${value}'.`);
+  return delayMs;
+}
+
+/**
  * Every `--json` invocation needs both the page metadata and the console buffer.
  * The two reads are independent, so issue them together instead of paying two
  * sequential daemon round-trips on top of the caller's own command. Both helpers
@@ -914,6 +1123,27 @@ async function readPageMetadata(originalRun, session, clientInfo) {
 }
 
 /**
+ * Read the HTTP status of the page's main navigation. Plain `goto` (no
+ * navigation flags) is handled by upstream and its result carries no status,
+ * so report the same failure semantics as the enhanced path (issue #17).
+ * @param {any} originalRun
+ * @param {any} session
+ * @param {any} clientInfo
+ * @returns {Promise<number | null>}
+ */
+async function readNavigationStatus(originalRun, session, clientInfo) {
+  try {
+    const response = await originalRun.call(session, clientInfo, {
+      _: ['eval', '() => (performance.getEntriesByType("navigation")[0] || {}).responseStatus ?? null'],
+    }, { json: true, raw: false });
+    const value = Number(normalizeUpstreamResult(parseJsonText(response.text)));
+    return Number.isFinite(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * @param {Function} originalRun
  * @param {any} session
  * @param {any} clientInfo
@@ -978,16 +1208,25 @@ function parseHeaderLines(text) {
 
 /**
  * Parse a single `--header="Key: Value"` argument into an object. Multiple
- * comma-separated headers are supported.
+ * comma-separated headers are supported, but a comma inside a header value
+ * (Accept lists, HTTP dates, quoted strings) must be preserved: only a comma
+ * followed by a new `Name:` starts another header (issue #45).
  * @param {string} arg
  * @returns {Record<string, string>}
  */
 function parseHeaderArg(arg) {
   const headers = /** @type {Record<string, string>} */ ({});
+  const TOKEN = "[A-Za-z0-9!#$%&'*+.^_`|~-]+";
+  const startsHeader = new RegExp(`^\\s*(${TOKEN})\\s*:\\s*([\\s\\S]*)$`);
+  let currentName = null;
   for (const part of String(arg).split(',')) {
-    const kv = part.match(/^([^:]+):\s*(.*)$/);
-    if (kv)
-      headers[kv[1].trim()] = kv[2].trim();
+    const kv = part.match(startsHeader);
+    if (kv) {
+      currentName = kv[1].trim();
+      headers[currentName] = kv[2].trim();
+    } else if (currentName) {
+      headers[currentName] = `${headers[currentName]},${part}`;
+    }
   }
   return headers;
 }
@@ -1010,7 +1249,9 @@ function parseBodyText(text) {
  */
 function parseTabList(text) {
   const tabs = [];
-  const re = /^- (\d+):( \(current\))? \[([^\]]+)\]\(([^)]+)\)$/gm;
+  // Greedy title/URL so ordinary punctuation in page metadata (brackets in a
+  // title, parentheses in a URL) does not silently drop the tab (issue #63).
+  const re = /^- (\d+):( \(current\))? \[(.*)\]\((.*)\)\s*$/gm;
   let match;
   while ((match = re.exec(text)) !== null) {
     tabs.push({
@@ -1022,7 +1263,6 @@ function parseTabList(text) {
   }
   return { tabs };
 }
-
 /**
  * Parse console output:
  *   "Total messages: N (Errors: X, Warnings: Y)\n[ERROR] msg\n[WARNING] msg"
@@ -1055,6 +1295,16 @@ function parseConsoleOutput(text) {
     }
   }
 
+  // CloakBrowser's current builds do not deliver page console events, so an
+  // empty list must not be presented as "the page logged nothing" (issue #65).
+  if (!messages.length) {
+    return {
+      messages,
+      summary,
+      captureUnavailable: true,
+      hint: 'CloakBrowser does not currently deliver page console events; an empty list does not prove the page logged nothing. Use eval to read application state directly, or --engine=wreq/httpcloak for HTTP-level inspection.',
+    };
+  }
   return { messages, summary };
 }
 
@@ -1163,17 +1413,26 @@ async function fetchWithWreq(req) {
   const profiles = wreq.getProfiles();
   const newestChrome = profiles.filter(p => p.startsWith('chrome')).sort((a, b) => parseInt(b.split('_')[1], 10) - parseInt(a.split('_')[1], 10))[0];
   const startedAt = Date.now();
+  const proxy = proxyForEngine(req.url);
   const headers = { ...req.headers };
   if (req.data !== undefined && !Object.keys(headers).some(h => h.toLowerCase() === 'content-type'))
     headers['content-type'] = 'application/json';
-  const controller = new AbortController();
-  const timeout = req.timeoutMs ? setTimeout(() => controller.abort(), req.timeoutMs) : null;
   let response = null;
   let lastError = null;
   let attempts = 0;
+  let resolvedBody = /** @type {any} */ (null);
+  let resolvedBinary = false;
+  let resolvedHeaders = /** @type {Record<string, string>} */ ({});
+  // Each attempt gets its own abort scope: a timer that fires during the retry
+  // backoff must not poison the next attempt with an already-aborted signal,
+  // and a failed attempt must not leave a stale response behind (issue #40).
+  let activeSignal = /** @type {AbortSignal | null} */ (null);
+  let activeTimer = /** @type {ReturnType<typeof setTimeout> | null} */ (null);
   try {
     for (let i = 0; i < req.maxAttempts; i++) {
       attempts = i + 1;
+      const controller = new AbortController();
+      const timer = req.timeoutMs ? setTimeout(() => controller.abort(), req.timeoutMs) : null;
       try {
         response = await wreq.fetch(req.url, {
           method: req.method,
@@ -1181,35 +1440,56 @@ async function fetchWithWreq(req) {
           body: req.data !== undefined ? (typeof req.data === 'string' ? req.data : JSON.stringify(req.data)) : undefined,
           impersonate: newestChrome,
           redirect: 'follow',
-          signal: controller?.signal,
+          signal: controller.signal,
+          ...(proxy ? { proxy } : {}),
         });
         lastError = null;
+        activeSignal = controller.signal;
+        activeTimer = timer;
       } catch (error) {
         lastError = error;
+        response = null;
+        clearTimeout(timer);
       }
       const statusNow = response ? response.status : null;
       const shouldRetry = req.retryCount > 0 && i < req.maxAttempts - 1 && (lastError !== null || (statusNow !== null && statusNow >= 500));
       if (!shouldRetry)
         break;
+      // Retrying: drop the finished attempt's abort scope before sleeping.
+      clearTimeout(activeTimer);
+      activeTimer = null;
+      activeSignal = null;
       await new Promise(resolve => setTimeout(resolve, 1500));
     }
+    // Body consumption stays inside the timeout window: a stalled body must
+    // not outlive --timeout (issue #39).
+    if (response) {
+      const responseHeaders = /** @type {Record<string, string>} */ ({});
+      response.headers.forEach((value, name) => { responseHeaders[name.toLowerCase()] = value; });
+      const contentType = responseHeaders['content-type'] ?? '';
+      const isBinaryResponse = /octet-stream|image\/|application\/pdf|application\/zip|application\/gzip|audio\/|video\/|font\//.test(contentType);
+      const readBody = isBinaryResponse
+        ? response.arrayBuffer().then((/** @type {ArrayBuffer} */ buf) => ({ body: Buffer.from(buf).toString('base64'), binary: true }))
+        : response.text().then((/** @type {string} */ text) => ({ body: text, binary: false }));
+      const aborted = new Promise((_, reject) => {
+        const fail = () => reject(new Error(`Request timed out after ${req.timeoutMs}ms`));
+        if (activeSignal?.aborted)
+          return fail();
+        activeSignal?.addEventListener('abort', fail, { once: true });
+      });
+      const settled = await Promise.race([readBody, aborted]);
+      resolvedBody = settled.body;
+      resolvedBinary = settled.binary;
+      resolvedHeaders = responseHeaders;
+    }
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(activeTimer);
   }
   if (lastError && !response)
     throw lastError;
-  const responseHeaders = /** @type {Record<string, string>} */ ({});
-  response.headers.forEach((value, name) => { responseHeaders[name.toLowerCase()] = value; });
-  const contentType = responseHeaders['content-type'] ?? '';
-  const isBinary = /octet-stream|image\/|application\/pdf|application\/zip|application\/gzip|audio\/|video\/|font\//.test(contentType);
-  let body;
-  let binary = false;
-  if (isBinary) {
-    body = Buffer.from(await response.arrayBuffer()).toString('base64');
-    binary = true;
-  } else {
-    body = await response.text();
-  }
+  const responseHeaders = resolvedHeaders;
+  const body = resolvedBody;
+  const binary = resolvedBinary;
   let json = null;
   if (!binary) { try { json = JSON.parse(body); } catch {} }
   /** @type {{ status: any, statusText: any, url: any, redirected: boolean, headers: Record<string, string>, body: any, binary: boolean, json: any, attempts: number, retried: boolean, durationMs: number, engine: string, failed: boolean }} */
@@ -1239,7 +1519,8 @@ async function fetchWithWreq(req) {
  */
 async function fetchWithHttpcloak(req) {
   const { Session } = require('httpcloak');
-  const session = new Session({ preset: 'chrome-latest' });
+  const proxy = proxyForEngine(req.url);
+  const session = new Session({ preset: 'chrome-latest', ...(proxy ? { proxy } : {}) });
   const startedAt = Date.now();
   let response = null;
   let lastError = null;
@@ -1347,11 +1628,17 @@ async function emitEngineFetchResult(engineRequest, session, options, runOptions
       typeof engineResult.status === 'number' ? engineResult.status : null);
   if (engineChallenge.blocked) {
     engineResult.challenge = engineChallenge;
-    // Escalate identified challenges, including HTTP 403/429, while ordinary
-    // HTTP errors retain their original response and transport.
+    // Escalate identified challenges, including HTTP 403/429, but never
+    // automatically replay a potentially-mutating request: a POST that already
+    // reached the server must not be sent again just because it was challenged
+    // (issue #48). Only idempotent methods escalate implicitly.
+    const idempotent = ['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE', 'TRACE'].includes(String(engineRequest.method).toUpperCase());
     if (onEscalate && engineChallenge.type !== 'none' && engineRequest.engine !== 'browser') {
-      process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH = '1';
-      return { isError: false, text: '', escalate: true };
+      if (idempotent) {
+        process.env.PLAYWRIGHT_CLI_FORCE_BROWSER_FETCH = '1';
+        return { isError: false, text: '', escalate: true };
+      }
+      engineResult.escalationSkipped = `challenge detected on a ${String(engineRequest.method).toUpperCase()} request; not replayed automatically`;
     }
   }
   const ok = !engineResult.failed && !engineChallenge.blocked;
@@ -1384,11 +1671,17 @@ async function runEngineFetchFromArgv(argv, env) {
   const command = argv.find(arg => !arg.startsWith('-'));
   if (command !== 'fetch')
     return false;
+  // Help takes precedence over validation and dispatch: asking for usage must
+  // never execute the supplied request (issue #47).
+  if (argv.includes('--help') || argv.includes('-h')) {
+    process.stdout.write(`${FETCH_HELP}\n`);
+    return true;
+  }
   // Build the args object the way upstream's parser (minimist) would so
   // --method=POST, --method POST, --engine httpcloak, --data=... etc. reach
   // prepareCommandArgs as top-level keys instead of being stranded inside the
   // positional array.
-  const { positional, flags } = parseCliArgv(argv, 'fetch', new Set(['json', 'raw']));
+  const { positional, flags } = parseCliArgv(argv, 'fetch', { json: true, raw: true });
   const prepared = prepareCommandArgs({ _: ['fetch', ...positional], ...flags });
   if (prepared._?.[0] !== 'engine-fetch' || !prepared._engineRequest)
     return false;
@@ -1420,7 +1713,7 @@ async function runEngineFetchFromArgv(argv, env) {
  *
  * @param {string[]} argv
  * @param {string} command
- * @param {Set<string>} booleanKeys
+ * @param {Record<string, true>} booleanKeys - static lookup of boolean flags
  * @returns {{ positional: string[], flags: Record<string, string | boolean> }}
  */
 function parseCliArgv(argv, command, booleanKeys) {
@@ -1437,12 +1730,14 @@ function parseCliArgv(argv, command, booleanKeys) {
         continue;
       }
       const key = arg.slice(2);
-      if (booleanKeys.has(key)) {
+      if (booleanKeys[key]) {
         flags[key] = true;
         continue;
       }
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
+      // A value may legitimately start with a single dash (e.g. `--data -1`);
+      // only a following `--flag` should be treated as a new option (issue #52).
+      if (next !== undefined && !next.startsWith('--')) {
         flags[key] = next;
         i++;
       } else {
@@ -1505,15 +1800,22 @@ function hostOfUrl(url) {
  */
 function detectChallengeFromText(title, bodyText, status) {
   const lower = `${title ?? ''} ${bodyText ?? ''}`.toLowerCase();
-  if (lower.includes('just a moment') || lower.includes('checking your browser') || lower.includes('enable javascript'))
+  const has = (/** @type {string[]} */ ...needles) => needles.some(needle => lower.includes(needle));
+  // Corroborating signals for soft keywords: a public article mentioning a
+  // vendor, or a plain <noscript> notice, is not a challenge (issue #46).
+  const challengeContext = has('challenge', 'captcha', 'turnstile', 'verify', 'security check', 'cf-', 'ray id', 'protected by', 'blocked');
+  if (has('just a moment', 'checking your browser', 'performing security verification', 'ray id'))
     return { type: 'cloudflare', blocked: true };
-  if (lower.includes('performing security verification') || lower.includes('ray id'))
+  if (has('enable javascript') && challengeContext)
     return { type: 'cloudflare', blocked: true };
-  if (lower.includes('please enable js and disable any ad blocker') || lower.includes('datadome'))
+  if (has('please enable js and disable any ad blocker'))
     return { type: 'datadome', blocked: true };
-  if (lower.includes('access denied') || lower.includes('you have been blocked') || lower.includes('your access has been') || lower.includes("you don't have permission"))
+  // Vendor mention alone is not proof; require challenge context or a 403.
+  if (has('datadome') && (challengeContext || status === 403))
+    return { type: 'datadome', blocked: true };
+  if (has('you have been blocked', 'your access has been') || (status === 403 && has('access denied', "you don't have permission")))
     return { type: 'blocked', blocked: true };
-  if (lower.includes('select all squares') || lower.includes('i am not a robot') || lower.includes('verify you are human') || lower.includes('prove you are human') || lower.includes('complete the security check'))
+  if (has('select all squares', 'i am not a robot', 'verify you are human', 'prove you are human', 'complete the security check'))
     return { type: 'captcha', blocked: true };
   if (status === 403)
     return { type: '403', blocked: true };
@@ -1599,7 +1901,68 @@ function proxyDetails(env) {
   if (!server)
     return undefined;
   const bypass = env.PLAYWRIGHT_MCP_PROXY_BYPASS || env.NO_PROXY;
-  return bypass ? { server, bypass } : { server };
+  // Never surface embedded credentials in diagnostics (issue #60); routing
+  // still uses the raw value internally.
+  const sanitized = redactProxyCredentials(server);
+  return bypass ? { server: sanitized, bypass } : { server: sanitized };
+}
+
+/**
+ * Strip userinfo (`user:pass@`) from a proxy URL before exposing it in output.
+ * @param {string} server
+ * @returns {string}
+ */
+function redactProxyCredentials(server) {
+  try {
+    const parsed = new URL(server.includes('://') ? server : `http://${server}`);
+    if (!parsed.username && !parsed.password)
+      return server;
+    parsed.username = '';
+    parsed.password = '';
+    return parsed.toString();
+  } catch {
+    return server.replace(/\/\/[^/@]*@/, '//');
+  }
+}
+
+/**
+ * Resolve the proxy an HTTP engine should use for a URL, honoring the bypass
+ * list. Returns undefined when no proxy applies. Both wreq and httpcloak must
+ * actually route through it — the reported metadata must not claim a proxy the
+ * engine ignores (issue #44).
+ *
+ * @param {string} url
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string | undefined}
+ */
+function proxyForEngine(url, env = process.env) {
+  const server = env.PLAYWRIGHT_MCP_PROXY_SERVER || env.HTTPS_PROXY || env.HTTP_PROXY;
+  if (!server)
+    return undefined;
+  const bypass = env.PLAYWRIGHT_MCP_PROXY_BYPASS || env.NO_PROXY;
+  return bypass && isProxyBypassed(url, bypass) ? undefined : server;
+}
+
+/**
+ * @param {string} url
+ * @param {string} bypass comma-separated NO_PROXY-style list
+ * @returns {boolean}
+ */
+function isProxyBypassed(url, bypass) {
+  let host;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return bypass
+      .split(',')
+      .map(entry => entry.trim().toLowerCase())
+      .filter(Boolean)
+      .some((entry) => {
+        const suffix = entry.replace(/^\./, '');
+        return host === suffix || host.endsWith(`.${suffix}`);
+      });
 }
 
 /**
@@ -1800,6 +2163,7 @@ module.exports = {
   parseCliArgv,
   parseConsoleText,
   parseTimeoutMs,
+  parseTabList,
   prepareCommandArgs,
   resolveEvalOutputPath,
   runCleanup,
