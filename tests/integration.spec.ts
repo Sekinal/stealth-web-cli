@@ -1427,7 +1427,13 @@ test('parseConsoleOutput structures console text output', async ({}) => {
   // Empty console
   const empty = await runCli('-s=parse-console', 'console', '--json');
   const emptyPayload = JSON.parse(empty.output);
-  expect(emptyPayload.result).toEqual({ messages: [], summary: { total: 0, errors: 0, warnings: 0 } });
+  expect(emptyPayload.result).toEqual(expect.objectContaining({
+    messages: [],
+    summary: { total: 0, errors: 0, warnings: 0 },
+    // CloakBrowser does not deliver console events; say so rather than
+    // implying the page logged nothing (issue #65).
+    captureUnavailable: true,
+  }));
   await runCli('-s=parse-console', 'close');
 });
 
@@ -2594,6 +2600,205 @@ test('scrape --timeout preserves fractional seconds (issue 41)', async () => {
     // A sub-second bound must fail fast rather than silently become 60s.
     const result = await runCli('scrape', `http://127.0.0.1:${address.port}/slow`, '--timeout=0.2', '--retry=0');
     expect(result.exitCode, result.output).not.toBe(0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('wreq retry keeps a usable timeout scope for the retried attempt (issue 40)', async () => {
+  let requests = 0;
+  const server = http.createServer((req, res) => {
+    requests++;
+    res.writeHead(requests === 1 ? 500 : 200, { 'content-type': 'text/plain' });
+    res.end(requests === 1 ? 'First attempt failed' : 'Recovered');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    // Timeout (200ms) is shorter than the retry backoff (1500ms): the second
+    // attempt must still reach the server and succeed.
+    const result = await runCli('fetch', `http://127.0.0.1:${address.port}/`, '--engine=wreq', '--timeout=0.2', '--retry=1', '--json');
+    const payload = JSON.parse(result.output);
+    expect(requests, result.output).toBe(2);
+    expect(result.exitCode, result.output).toBe(0);
+    expect(payload.result.status).toBe(200);
+    expect(payload.result.body).toBe('Recovered');
+    expect(payload.result.attempts).toBe(2);
+    expect(payload.result.retried).toBe(true);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('goto reports HTTP failures consistently across modes and flags (issue 17)', async () => {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/fail') {
+      res.writeHead(500, { 'content-type': 'text/html' });
+      return res.end('<html><body>Fixture server failure</body></html>');
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body>Ready</body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    await runCli('-s=issue17', 'open', `${base}/`);
+
+    const ok = await runCli('-s=issue17', 'goto', `${base}/`, '--json');
+    expect(ok.exitCode, ok.output).toBe(0);
+    expect(JSON.parse(ok.output).ok).toBe(true);
+
+    // Plain goto (no navigation flags) must still surface the HTTP failure.
+    const plain = await runCli('-s=issue17', 'goto', `${base}/fail`, '--json');
+    const payload = JSON.parse(plain.output);
+    expect(plain.exitCode, plain.output).not.toBe(0);
+    expect(payload.ok).toBe(false);
+    expect(payload.result.status).toBe(500);
+    expect(payload.error).toContain('500');
+
+    const withTimeout = await runCli('-s=issue17', 'goto', `${base}/fail`, '--timeout=3', '--json');
+    expect(withTimeout.exitCode, withTimeout.output).not.toBe(0);
+    expect(JSON.parse(withTimeout.output).result.status).toBe(500);
+
+    const text = await runCli('-s=issue17', 'goto', `${base}/fail`);
+    expect(text.exitCode, `text mode: ${text.output}`).not.toBe(0);
+    await runCli('-s=issue17', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('scrape csv distinguishes zero matches from missing extraction config (issue 53)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body><h1>Present</h1></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    // Valid selector that matches nothing: empty CSV, not a missing-flags error.
+    const empty = await runCli('scrape', `${base}/`, '--select=.missing', '--output-format=csv', '--retry=0');
+    expect(empty.exitCode, empty.output).toBe(0);
+    expect(empty.output.trim()).toBe('text,html');
+
+    // No extraction option at all is still a validation error.
+    const none = await runCli('scrape', `${base}/`, '--output-format=csv', '--retry=0');
+    expect(none.exitCode, none.output).not.toBe(0);
+    expect(none.output + none.error).toContain('requires --select or --schema');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('scrape reports a same-origin seed redirect explicitly (issue 54)', async () => {
+  const target = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body>Destination content</body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { target.once('error', reject); target.listen(0, '127.0.0.1', resolve); });
+  const targetAddress = target.address();
+  if (!targetAddress || typeof targetAddress === 'string') throw new Error('Expected a TCP server address');
+  const seed = http.createServer((req, res) => {
+    res.writeHead(302, { Location: `http://127.0.0.1:${targetAddress.port}/` });
+    res.end();
+  });
+  await new Promise<void>((resolve, reject) => { seed.once('error', reject); seed.listen(0, '127.0.0.1', resolve); });
+  const seedAddress = seed.address();
+  if (!seedAddress || typeof seedAddress === 'string') throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${seedAddress.port}`;
+  try {
+    const rejected = await runCli('scrape', `${base}/`, '--retry=0');
+    const payload = JSON.parse(rejected.output);
+    expect(payload.ok).toBe(false);
+    expect(payload.skipped).toBe(true);
+    expect(payload.status).toBe(200);
+    expect(payload.url).toBe(`http://127.0.0.1:${targetAddress.port}/`);
+    expect(payload.requestedUrl).toBe(`${base}/`);
+    expect(payload.error).toContain('same-origin boundary');
+
+    const followed = await runCli('scrape', `${base}/`, '--retry=0', '--same-origin=false');
+    const followedPayload = JSON.parse(followed.output);
+    expect(followedPayload.ok, followed.output).toBe(true);
+    expect(followedPayload.text).toContain('Destination content');
+  } finally {
+    seed.closeAllConnections();
+    target.closeAllConnections();
+    await new Promise<void>(resolve => seed.close(() => resolve()));
+    await new Promise<void>(resolve => target.close(() => resolve()));
+  }
+});
+
+test('browser engine diagnoses a cross-origin CORS failure while wreq succeeds (issue 16)', async () => {
+  const sessionPage = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body>Ready</body></html>');
+  });
+  const other = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"value":42}');
+  });
+  await new Promise<void>((resolve, reject) => { sessionPage.once('error', reject); sessionPage.listen(0, '127.0.0.1', resolve); });
+  await new Promise<void>((resolve, reject) => { other.once('error', reject); other.listen(0, '127.0.0.1', resolve); });
+  const pageAddress = sessionPage.address();
+  const otherAddress = other.address();
+  if (!pageAddress || typeof pageAddress === 'string' || !otherAddress || typeof otherAddress === 'string')
+    throw new Error('Expected TCP server addresses');
+  const target = `http://127.0.0.1:${otherAddress.port}/api`;
+  try {
+    await runCli('-s=issue16', 'open', `http://127.0.0.1:${pageAddress.port}/`);
+    const browser = await runCli('-s=issue16', 'fetch', target, '--engine=browser', '--timeout=3', '--json');
+    const payload = JSON.parse(browser.output);
+    expect(browser.exitCode, browser.output).not.toBe(0);
+    expect(payload.ok).toBe(false);
+    // The failure must explain the origin restriction rather than a bare
+    // "Failed to fetch", and point at the transport that works.
+    expect(payload.error).toMatch(/cross-origin|CORS/i);
+    expect(payload.error).toContain('--engine=wreq');
+
+    // The same cross-origin target succeeds on the plain-HTTP engines.
+    const wreq = await runCli('fetch', target, '--engine=wreq', '--json');
+    expect(wreq.exitCode, wreq.output).toBe(0);
+    expect(JSON.parse(wreq.output).result.json).toEqual({ value: 42 });
+    await runCli('-s=issue16', 'close');
+  } finally {
+    sessionPage.closeAllConnections();
+    other.closeAllConnections();
+    await new Promise<void>(resolve => sessionPage.close(() => resolve()));
+    await new Promise<void>(resolve => other.close(() => resolve()));
+  }
+});
+
+test('console reports the CloakBrowser capture limitation instead of a false zero (issue 65)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body><script>console.error("Fixture page error");</script>Fixture</body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    await runCli('-s=issue65', 'open', `http://127.0.0.1:${address.port}/`);
+    const result = await runCli('-s=issue65', 'console', '--json');
+    const payload = JSON.parse(result.output).result;
+    expect(Array.isArray(payload.messages)).toBe(true);
+    if (payload.messages.length === 0) {
+      // The provider does not deliver console events: say so rather than
+      // implying the page produced no output.
+      expect(payload.captureUnavailable).toBe(true);
+      expect(payload.hint).toContain('CloakBrowser');
+    } else {
+      expect(payload.captureUnavailable).toBeUndefined();
+    }
+    await runCli('-s=issue65', 'close');
   } finally {
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));

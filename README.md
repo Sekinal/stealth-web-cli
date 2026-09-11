@@ -135,6 +135,17 @@ The dashboard opens a window with two views:
 
 From the grid you can also close running sessions or delete data for inactive ones.
 
+### Known limitations
+
+- **Browser-engine fetch is origin-bound.** `fetch --engine=browser` performs the request inside the
+  current tab, so it inherits that page's origin policy: a cross-origin response without CORS headers
+  cannot be read (the request reaches the server, but the browser refuses to expose it). The CLI
+  reports this explicitly; use the default `--engine=wreq` (or `--engine=httpcloak`) for cross-origin
+  targets, which are not CORS-bound.
+- **Console capture is unavailable under CloakBrowser.** Current CloakBrowser builds do not deliver
+  page console events, so `console` reports `captureUnavailable` with a hint when it has no messages;
+  an empty list does not prove the page logged nothing. Read application state with `eval` instead.
+
 ## Commands
 
 ### Core

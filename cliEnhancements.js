@@ -331,6 +331,12 @@ function patchSession(Session, options) {
                 const requested = typeof args._?.[1] === 'string' ? args._[1] : '';
                 console.error(`[playwright-cli] Warning: goto landed on a different host than requested. Requested: ${hostOfUrl(requested) || requested}; final URL: ${parsed.url}`);
               }
+            } else {
+              // Plain goto: no enhanced result section, so read the navigation
+              // status directly and fail the same way (issue #17).
+              const navStatus = await readNavigationStatus(originalRun, this, clientInfo);
+              if (navStatus !== null && navStatus >= 400)
+                process.exitCode = 1;
             }
           } catch {}
         }
@@ -378,6 +384,17 @@ function patchSession(Session, options) {
           error: normalizedResult.error ?? `captcha (${normalizedResult.captcha}) was not solved within the timeout`,
         };
         return { ...result, text: JSON.stringify(payload, null, 2) };
+      }
+      // Plain goto (no navigation flags) is upstream-handled and carries no
+      // status; read it so 4xx/5xx fail consistently with the enhanced path
+      // and with the other output modes (issue #17).
+      if (cmd === 'goto' && normalizedResult && !Array.isArray(normalizedResult) && typeof normalizedResult === 'object' && normalizedResult.status === undefined) {
+        const navStatus = await readNavigationStatus(originalRun, this, clientInfo);
+        if (navStatus !== null) {
+          normalizedResult.status = navStatus;
+          if (navStatus >= 400)
+            normalizedResult.failed = true;
+        }
       }
       if ((cmd === 'fetch' || cmd === 'goto') && normalizedResult && !Array.isArray(normalizedResult) && typeof normalizedResult === 'object' && normalizedResult.failed) {
         process.exitCode = 1;
@@ -700,12 +717,27 @@ function prepareCommandArgs(args) {
       // In-page fetch: the request rides CloakBrowser's own network stack
       // (BoringSSL + Chrome h2), not the Node-side APIRequestContext.
       response = await page.evaluate(async ({ url, method, data, headers, timeoutMs }) => {
-        const res = await fetch(url, {
-          method,
-          ...(data !== undefined ? { body: data } : {}),
-          ...(headers && Object.keys(headers).length ? { headers } : {}),
-          ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
-        });
+        let res;
+        try {
+          res = await fetch(url, {
+            method,
+            ...(data !== undefined ? { body: data } : {}),
+            ...(headers && Object.keys(headers).length ? { headers } : {}),
+            ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+          });
+        } catch (error) {
+          // The in-page fetch is bound by the tab's origin policy: a cross-origin
+          // response without CORS headers is unreadable even though the server
+          // answered. Report that precisely instead of a bare "Failed to fetch"
+          // (issue #16).
+          let targetOrigin = null;
+          try { targetOrigin = new URL(url).origin; } catch {}
+          return {
+            fetchError: (error && error.message) || String(error),
+            pageOrigin: location.origin,
+            targetOrigin,
+          };
+        }
         const responseHeaders = Object.fromEntries(res.headers.entries());
         const contentType = responseHeaders['content-type'] || '';
         const isBinary = /octet-stream|image\\/|application\\/pdf|application\\/zip|application\\/gzip|audio\\/|video\\/|font\\//.test(contentType);
@@ -732,9 +764,17 @@ function prepareCommandArgs(args) {
           redirected: res.redirected,
         };
       }, { url, method: ${JSON.stringify(method)}, data: ${JSON.stringify(data)}, headers: ${JSON.stringify(mergedHeaders)}, timeoutMs: ${timeoutMs ?? 'null'} });
+      if (response && response.fetchError) {
+        const crossOrigin = response.targetOrigin && response.targetOrigin !== response.pageOrigin;
+        const hint = crossOrigin
+          ? ' The target is cross-origin from the session page and did not grant CORS access, so the browser refused to expose the response. Use --engine=wreq or --engine=httpcloak for cross-origin targets.'
+          : '';
+        throw new Error('Browser-engine fetch failed for ' + url + ': ' + response.fetchError + '.' + hint);
+      }
       lastError = null;
     } catch (e) {
       lastError = e;
+      response = null;
     }
     const statusNow = response ? response.status : null;
     const shouldRetry = ${retryCount} > 0 && i < ${maxAttempts} - 1 && (lastError !== null || (statusNow !== null && statusNow >= 500));
@@ -1083,6 +1123,27 @@ async function readPageMetadata(originalRun, session, clientInfo) {
 }
 
 /**
+ * Read the HTTP status of the page's main navigation. Plain `goto` (no
+ * navigation flags) is handled by upstream and its result carries no status,
+ * so report the same failure semantics as the enhanced path (issue #17).
+ * @param {any} originalRun
+ * @param {any} session
+ * @param {any} clientInfo
+ * @returns {Promise<number | null>}
+ */
+async function readNavigationStatus(originalRun, session, clientInfo) {
+  try {
+    const response = await originalRun.call(session, clientInfo, {
+      _: ['eval', '() => (performance.getEntriesByType("navigation")[0] || {}).responseStatus ?? null'],
+    }, { json: true, raw: false });
+    const value = Number(normalizeUpstreamResult(parseJsonText(response.text)));
+    return Number.isFinite(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * @param {Function} originalRun
  * @param {any} session
  * @param {any} clientInfo
@@ -1234,6 +1295,16 @@ function parseConsoleOutput(text) {
     }
   }
 
+  // CloakBrowser's current builds do not deliver page console events, so an
+  // empty list must not be presented as "the page logged nothing" (issue #65).
+  if (!messages.length) {
+    return {
+      messages,
+      summary,
+      captureUnavailable: true,
+      hint: 'CloakBrowser does not currently deliver page console events; an empty list does not prove the page logged nothing. Use eval to read application state directly, or --engine=wreq/httpcloak for HTTP-level inspection.',
+    };
+  }
   return { messages, summary };
 }
 
@@ -1346,25 +1417,22 @@ async function fetchWithWreq(req) {
   const headers = { ...req.headers };
   if (req.data !== undefined && !Object.keys(headers).some(h => h.toLowerCase() === 'content-type'))
     headers['content-type'] = 'application/json';
-  const controller = new AbortController();
-  const timeout = req.timeoutMs ? setTimeout(() => controller.abort(), req.timeoutMs) : null;
-  // Created before the request so an abort that fires during/after the headers
-  // is still observed by the body read (issue #39).
-  const aborted = new Promise((_, reject) => {
-    const fail = () => reject(new Error(`Request timed out after ${req.timeoutMs}ms`));
-    if (controller.signal.aborted)
-      return fail();
-    controller.signal.addEventListener('abort', fail, { once: true });
-  });
   let response = null;
   let lastError = null;
   let attempts = 0;
   let resolvedBody = /** @type {any} */ (null);
   let resolvedBinary = false;
   let resolvedHeaders = /** @type {Record<string, string>} */ ({});
+  // Each attempt gets its own abort scope: a timer that fires during the retry
+  // backoff must not poison the next attempt with an already-aborted signal,
+  // and a failed attempt must not leave a stale response behind (issue #40).
+  let activeSignal = /** @type {AbortSignal | null} */ (null);
+  let activeTimer = /** @type {ReturnType<typeof setTimeout> | null} */ (null);
   try {
     for (let i = 0; i < req.maxAttempts; i++) {
       attempts = i + 1;
+      const controller = new AbortController();
+      const timer = req.timeoutMs ? setTimeout(() => controller.abort(), req.timeoutMs) : null;
       try {
         response = await wreq.fetch(req.url, {
           method: req.method,
@@ -1372,17 +1440,25 @@ async function fetchWithWreq(req) {
           body: req.data !== undefined ? (typeof req.data === 'string' ? req.data : JSON.stringify(req.data)) : undefined,
           impersonate: newestChrome,
           redirect: 'follow',
-          signal: controller?.signal,
+          signal: controller.signal,
           ...(proxy ? { proxy } : {}),
         });
         lastError = null;
+        activeSignal = controller.signal;
+        activeTimer = timer;
       } catch (error) {
         lastError = error;
+        response = null;
+        clearTimeout(timer);
       }
       const statusNow = response ? response.status : null;
       const shouldRetry = req.retryCount > 0 && i < req.maxAttempts - 1 && (lastError !== null || (statusNow !== null && statusNow >= 500));
       if (!shouldRetry)
         break;
+      // Retrying: drop the finished attempt's abort scope before sleeping.
+      clearTimeout(activeTimer);
+      activeTimer = null;
+      activeSignal = null;
       await new Promise(resolve => setTimeout(resolve, 1500));
     }
     // Body consumption stays inside the timeout window: a stalled body must
@@ -1395,13 +1471,19 @@ async function fetchWithWreq(req) {
       const readBody = isBinaryResponse
         ? response.arrayBuffer().then((/** @type {ArrayBuffer} */ buf) => ({ body: Buffer.from(buf).toString('base64'), binary: true }))
         : response.text().then((/** @type {string} */ text) => ({ body: text, binary: false }));
+      const aborted = new Promise((_, reject) => {
+        const fail = () => reject(new Error(`Request timed out after ${req.timeoutMs}ms`));
+        if (activeSignal?.aborted)
+          return fail();
+        activeSignal?.addEventListener('abort', fail, { once: true });
+      });
       const settled = await Promise.race([readBody, aborted]);
       resolvedBody = settled.body;
       resolvedBinary = settled.binary;
       resolvedHeaders = responseHeaders;
     }
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(activeTimer);
   }
   if (lastError && !response)
     throw lastError;

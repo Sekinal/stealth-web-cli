@@ -531,7 +531,7 @@ async function buildLaunchConfig(plan) {
  * @param {ReturnType<typeof parseScrapeArgs>} plan
  */
 function createScrapeState(plan) {
-  return { plan, results: [], failedRequests: [], blocked: 0 };
+  return { plan, results: [], failedRequests: [], blocked: 0, skipped: 0 };
 }
 
 /**
@@ -593,8 +593,32 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
       const title = await context.page.title().catch(() => '');
       // Same-origin boundary is enforced on the *final* URL: a link that
       // redirected to another origin (host or port) is dropped here, so it is
-      // never captured as content.
-      if (plan.sameOrigin && originOf(url) !== plan.origin) return;
+      // never captured as content. The rejection is recorded explicitly with
+      // the requested/final URL, status and duration, instead of vanishing into
+      // an unexplained empty result (issue #54).
+      if (plan.sameOrigin && originOf(url) !== plan.origin) {
+        state.skipped++;
+        state.results.push({
+          type: 'result',
+          url,
+          requestedUrl: request.url,
+          title,
+          status,
+          depth,
+          text: '',
+          html: '',
+          links: [],
+          challenge: null,
+          skipped: true,
+          error: `Navigation left the same-origin boundary: requested ${request.url}, landed on ${url} (allowed origin ${plan.origin}). Pass --same-origin=false to follow cross-origin redirects.`,
+          attempts: request.retryCount + 1,
+          retried: request.retryCount > 0,
+          retries: request.retryCount,
+          durationMs: Date.now() - startedAt,
+          requestId: request.id,
+        });
+        return;
+      }
       let challenge = await detectRenderedChallenge(context, status);
       if (challenge.blocked && (await solveRenderedChallenge(context, challenge, plan.timeoutSecs * 500))) {
         // Success requires observing the page unblocked after token injection.
@@ -717,7 +741,17 @@ function formatScrape(payload, format, crawl) {
   if (format === 'csv') {
     const records = crawl ? payload.results : [payload];
     const rows = [];
+    // Columns implied by the configured extraction, so a configured selector
+    // that matches nothing yields a valid empty CSV (header only) instead of
+    // being reported as missing --select/--schema (issue #53).
+    const configured = new Set();
     for (const record of records) {
+      if (record.extracted && typeof record.extracted === 'object')
+        for (const key of Object.keys(record.extracted)) configured.add(key);
+      if (record.selected) {
+        configured.add('text');
+        configured.add('html');
+      }
       if (record.extracted) {
         rows.push(record.extracted);
       } else if (record.selected) {
@@ -728,7 +762,7 @@ function formatScrape(payload, format, crawl) {
           rows.push({ ...element.attrs, text: element.text, html: element.html });
       }
     }
-    const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))];
+    const columns = rows.length ? [...new Set(rows.flatMap((row) => Object.keys(row)))] : [...configured];
     if (!columns.length) throw new Error('CSV output requires --select or --schema extraction.');
     const escape = (value) => {
       const text = Array.isArray(value) ? value.join(' ') : value == null ? '' : String(value);
@@ -774,13 +808,14 @@ async function runScrape(argv) {
       results: state.results,
       requestsProcessed: state.results.length,
       blocked: state.blocked,
+      skipped: state.skipped,
       failedRequests: state.failedRequests,
       durationMs: Date.now() - startedAt,
     };
     payload.ok = state.blocked === 0 && failedCount === 0 && state.results.length > 0 && !state.results.some(record => record.failed);
   } else if (state.results.length) {
     payload = state.results[0];
-    payload.ok = !payload.failed && !payload.blocked && !payload.challenge?.blocked && (payload.status === null || payload.status < 400);
+    payload.ok = !payload.failed && !payload.blocked && !payload.skipped && !payload.challenge?.blocked && (payload.status === null || payload.status < 400);
   } else {
     const failed = state.failedRequests[0];
     payload = failed
