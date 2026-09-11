@@ -51,6 +51,14 @@ async function main() {
     runCleanup(argv);
     return;
   }
+  // Install this package's own skill, not playwright-core's upstream copy
+  // (issue #64).
+  if (command === 'install' && argv.some(arg => arg.startsWith('--skills'))) {
+    const { installBundledSkill } = require('./skillCheck');
+    const target = argv.find(arg => arg.startsWith('--skills='))?.split('=')[1];
+    installBundledSkill(target);
+    return;
+  }
   if (command !== 'install')
     checkInstalledSkills();
   // Non-browser fetch engines run without a session; the upstream program

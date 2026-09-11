@@ -2424,3 +2424,55 @@ test('goto on an HTTP 200 challenge is an unsuccessful outcome (issue 51)', asyn
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('scrape csv keeps text/html when an attribute shares the name (issue 42)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body><h1 text="attribute text" html="attribute html">Actual heading</h1></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    const json = await runCli('scrape', `http://127.0.0.1:${address.port}/`, '--select=h1', '--retry=0');
+    const selected = JSON.parse(json.output).selected[0];
+    expect(selected.text).toBe('Actual heading');
+    expect(selected.attrs).toEqual({ text: 'attribute text', html: 'attribute html' });
+
+    const csv = await runCli('scrape', `http://127.0.0.1:${address.port}/`, '--select=h1', '--output-format=csv', '--retry=0');
+    const [header, row] = csv.output.trim().split('\n');
+    const columns = header.split(',');
+    const values = row.split(',').reduce((acc, value, index) => ({ ...acc, [columns[index]]: value }), {});
+    // The reserved fields survive; the colliding attributes are preserved too.
+    expect(values.text).toBe('Actual heading');
+    expect(values.html).toContain('Actual heading');
+    expect(csv.output).toContain('attribute text');
+    expect(csv.output).toContain('attribute html');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('install --skills installs this package skill, not the upstream one (issue 64)', async () => {
+  const cwd = test.info().outputPath();
+  const bundled = path.join(__dirname, '..', 'skills', 'playwright-cli', 'SKILL.md');
+  const bundledText = fs.readFileSync(bundled, 'utf8').replace(/\r\n/g, '\n');
+
+  for (const target of [
+    { args: ['install', '--skills'], dir: path.join(cwd, '.claude', 'skills', 'playwright-cli') },
+    { args: ['install', '--skills=agents'], dir: path.join(cwd, '.agents', 'skills', 'playwright-cli') },
+  ]) {
+    const installed = await runCliWithOptions({ cwd }, ...target.args);
+    expect(installed.exitCode, installed.output).toBe(0);
+    const text = fs.readFileSync(path.join(target.dir, 'SKILL.md'), 'utf8').replace(/\r\n/g, '\n');
+    expect(text).toBe(bundledText);
+    expect(text).toContain('playwright-cli fetch');
+    expect(text).toContain('playwright-cli scrape');
+    expect(fs.existsSync(path.join(target.dir, 'references'))).toBe(true);
+
+    // A freshly installed skill must not be reported as stale.
+    const help = await runCliWithOptions({ cwd }, '--help');
+    expect(help.error).not.toContain('does not match the tool version');
+  }
+});

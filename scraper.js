@@ -640,9 +640,11 @@ function formatScrape(payload, format, crawl) {
       if (record.extracted) {
         rows.push(record.extracted);
       } else if (record.selected) {
-        // Flatten each selected element into its own row (text/html/attrs).
+        // Reserved extraction fields win over same-named HTML attributes, or
+        // an attribute literally called `text`/`html` would overwrite the real
+        // extracted content (issue #42).
         for (const element of record.selected)
-          rows.push({ text: element.text, html: element.html, ...element.attrs });
+          rows.push({ ...element.attrs, text: element.text, html: element.html });
       }
     }
     const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))];

@@ -19,9 +19,36 @@
 const fs = require('fs');
 const path = require('path');
 
+/**
+ * The bundled skill is this package's own customized skill (fetch/scrape and
+ * the stealth CLI instructions), not playwright-core's upstream copy
+ * (issue #64).
+ * @returns {string}
+ */
+function bundledSkillDir() {
+  return path.join(__dirname, 'skills', 'playwright-cli');
+}
+
+/**
+ * @returns {string}
+ */
 function bundledSkillFile() {
-  const programPath = require.resolve('playwright-core/lib/tools/cli-client/program');
-  return path.join(path.dirname(programPath), 'skill', 'SKILL.md');
+  return path.join(bundledSkillDir(), 'SKILL.md');
+}
+
+/**
+ * Copy this package's bundled skill (SKILL.md + references) into the requested
+ * target, instead of letting upstream install playwright-core's copy (#64).
+ * @param {string | undefined} target 'agents' or undefined/anything else for claude
+ */
+function installBundledSkill(target) {
+  const cwd = process.cwd();
+  const dir = target === 'agents'
+    ? path.join(cwd, '.agents', 'skills', 'playwright-cli')
+    : path.join(cwd, '.claude', 'skills', 'playwright-cli');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.cpSync(bundledSkillDir(), dir, { recursive: true });
+  console.log(`Installed the stealth-web-cli skill to ${path.relative(cwd, dir) || dir}`);
 }
 
 function installedSkillTargets() {
@@ -76,4 +103,4 @@ function checkInstalledSkills() {
   }
 }
 
-module.exports = { checkInstalledSkills, frame };
+module.exports = { checkInstalledSkills, frame, installBundledSkill };
