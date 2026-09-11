@@ -2077,3 +2077,118 @@ test('wreq --timeout bounds body consumption, not just headers (issue 39)', asyn
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('scrape reports truncation instead of silently capping extraction (issue 61)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(`<html><body><ul>${Array.from({ length: 12 }, (_, i) => `<li>item-${i}</li>`).join('')}</ul></body></html>`);
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  const schemaFile = path.join(test.info().outputPath(), 'all-schema.json');
+  fs.writeFileSync(schemaFile, JSON.stringify({ items: { selector: 'li', all: true } }));
+  try {
+    // Cap below the match count: partial output must be flagged.
+    const capped = await runCli('scrape', `${base}/`, '--select=li', '--max-items=5');
+    const cappedPayload = JSON.parse(capped.output);
+    expect(cappedPayload.selected).toHaveLength(5);
+    expect(cappedPayload.truncated.selected).toEqual({ returned: 5, total: 12 });
+
+    const cappedSchema = await runCli('scrape', `${base}/`, `--schema=${schemaFile}`, '--max-items=5');
+    expect(JSON.parse(cappedSchema.output).truncated.items).toEqual({ returned: 5, total: 12 });
+
+    // Above the match count: complete output, no truncation metadata.
+    const complete = await runCli('scrape', `${base}/`, '--select=li', '--max-items=50');
+    const completePayload = JSON.parse(complete.output);
+    expect(completePayload.selected).toHaveLength(12);
+    expect(completePayload.truncated).toBeUndefined();
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('scrape csv round-trips values containing CR, LF, commas and quotes (issue 62)', async () => {
+  const value = 'alpha\rbravo\ncharlie,dave"echo';
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(`<html><body><p data-value="${value.replace(/&/g, '&amp;').replace(/"/g, '&quot;')}">Fixture</p></body></html>`);
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const schemaFile = path.join(test.info().outputPath(), 'cr-schema.json');
+  fs.writeFileSync(schemaFile, JSON.stringify({ value: { selector: 'p', attr: 'data-value' } }));
+  try {
+    const result = await runCli('scrape', `http://127.0.0.1:${address.port}/`, `--schema=${schemaFile}`, '--output-format=csv');
+    const lines = result.output.split('\n');
+    expect(lines[0]).toBe('value');
+    // The data row is one quoted field: 1 header + 1 record, not several.
+    const dataRow = result.output.slice(result.output.indexOf('\n') + 1);
+    expect(dataRow.startsWith('"')).toBe(true);
+    expect(dataRow.trimEnd().endsWith('"')).toBe(true);
+    expect(dataRow).toContain('""echo');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('fetch preserves header values containing commas (issue 45)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ headers: req.headers }));
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    const accept = await runCli('fetch', `http://127.0.0.1:${address.port}/`, '--engine=wreq', '--header=Accept: application/json, text/plain', '--json');
+    expect(JSON.parse(accept.output).result.json.headers.accept).toBe('application/json, text/plain');
+
+    const date = 'Wed, 21 Oct 2015 07:28:00 GMT';
+    const modified = await runCli('fetch', `http://127.0.0.1:${address.port}/`, '--engine=wreq', `--header=If-Modified-Since: ${date}`, '--json');
+    expect(JSON.parse(modified.output).result.json.headers['if-modified-since']).toBe(date);
+
+    // Bare name and explicit multiple headers still work.
+    const multi = await runCli('fetch', `http://127.0.0.1:${address.port}/`, '--engine=wreq', '--header=X-One: 1, X-Two: 2', '--json');
+    const headers = JSON.parse(multi.output).result.json.headers;
+    expect(headers['x-one']).toBe('1');
+    expect(headers['x-two']).toBe('2');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('fetch result shape is identical across engines for a JSON body (issue 68)', async () => {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/api') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end('{"value":42}');
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><title>Host</title><body>ok</body></html>');
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected a TCP server address');
+  const base = `http://127.0.0.1:${address.port}`;
+  const fields = ['status', 'statusText', 'url', 'redirected', 'headers', 'body', 'attempts', 'retried', 'binary', 'json', 'failed'];
+  try {
+    await runCli('-s=issue68', 'open', `${base}/`);
+    const wreq = JSON.parse((await runCli('-s=issue68', 'fetch', `${base}/api`, '--engine=wreq', '--json')).output).result;
+    const browser = JSON.parse((await runCli('-s=issue68', 'fetch', `${base}/api`, '--engine=browser', '--json')).output).result;
+    for (const field of fields)
+      expect(Object.hasOwn(browser, field), `browser engine result missing '${field}'`).toBe(true);
+    expect(wreq.json).toEqual({ value: 42 });
+    expect(browser.json).toEqual({ value: 42 });
+    expect(browser.binary).toBe(false);
+    await runCli('-s=issue68', 'close');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

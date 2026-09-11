@@ -26,6 +26,12 @@ const DEFAULT_RETRIES = 3;
 const DEFAULT_TIMEOUT_SECS = 60;
 const DEFAULT_MAX_DEPTH = 10;
 
+// Extraction caps. Hitting one is reported in the result (`truncated`) so a
+// partial extraction never masquerades as complete (issue #61); --max-items
+// raises the per-field/selection cap.
+const DEFAULT_MAX_ITEMS = 5000;
+const MAX_TEXT_CHARS = 200000;
+
 /**
  * Extract the origin (protocol + host + port) of a URL, or the input as-is
  * when it cannot be parsed.
@@ -47,6 +53,7 @@ const SCRAPE_HELP = `playwright-cli scrape <url>               scrape rendered c
   --same-origin=true|false                only follow same-origin links (default true)
   --concurrency=<N> / --requests-per-minute=<N>
                                           parallel pages / request rate limit
+  --max-items=<N>                         extraction cap for select/schema-all/links (default 5000)
   --select=<css>                          extract matching elements
   --output-format=json|text|markdown|csv  output format (default json)
   --schema=<json-file>                    extract fields: { field: { selector, attr?, all? } }
@@ -77,6 +84,7 @@ function parseScrapeArgs(argv) {
       crawl: false,
       maxRequests: 1,
       maxDepth: 0,
+      maxItems: DEFAULT_MAX_ITEMS,
       concurrency: 1,
       requestsPerMinute: 0,
       sameOrigin: true,
@@ -107,6 +115,7 @@ function parseScrapeArgs(argv) {
   const concurrency = flags.concurrency !== undefined ? Math.max(1, parseInt(String(flags.concurrency), 10) || 1) : 1;
   const requestsPerMinute =
     flags['requests-per-minute'] !== undefined ? Math.max(1, parseInt(String(flags['requests-per-minute']), 10) || 1) : 0;
+  const maxItems = flags['max-items'] !== undefined ? Math.max(1, parseInt(String(flags['max-items']), 10) || DEFAULT_MAX_ITEMS) : DEFAULT_MAX_ITEMS;
   const sameOrigin = flags['same-origin'] !== 'false';
   const outputFormat = String(flags['output-format'] ?? 'json').toLowerCase();
   if (!['json', 'text', 'markdown', 'csv'].includes(outputFormat))
@@ -117,6 +126,7 @@ function parseScrapeArgs(argv) {
   return {
     url,
     origin: originOf(url),
+    maxItems,
     crawl,
     maxRequests,
     maxDepth,
@@ -171,28 +181,36 @@ function loadSchema(schemaFile) {
 }
 
 /**
- * Extract fields from the rendered page according to a schema.
+ * Extract fields from the rendered page according to a schema. `all: true`
+ * fields report truncation when the match count exceeds `maxItems` (issue #61).
  * @param {import('crawlee').PlaywrightCrawlingContext} context
  * @param {Record<string, { selector: string, attr?: string | undefined, all?: boolean | undefined }>} schema
+ * @param {number} maxItems
+ * @returns {Promise<{ values: Record<string, unknown>, truncated: Record<string, { returned: number, total: number }> }>}
  */
-async function extractBySchema(context, schema) {
-  const result = {};
+async function extractBySchema(context, schema, maxItems) {
+  const values = /** @type {Record<string, unknown>} */ ({});
+  const truncated = /** @type {Record<string, { returned: number, total: number }>} */ ({});
   for (const [name, extractor] of Object.entries(schema)) {
     const { selector, attr, all } = extractor;
     const attrName = attr ?? null;
     if (all) {
-      result[name] = await context.page.$$eval(
+      const { items, total } = await context.page.$$eval(
         selector,
-        (elements, opts) =>
-          elements.slice(0, 2000).map((el) => {
+        (elements, opts) => ({
+          items: elements.slice(0, opts.limit).map((el) => {
             if (opts.attr) return el.getAttribute(opts.attr);
             const node = /** @type {HTMLElement} */ (el);
             return (node.innerText ?? el.textContent ?? '').trim();
           }),
-        { attr: attrName },
+          total: elements.length,
+        }),
+        { attr: attrName, limit: maxItems },
       );
+      values[name] = items;
+      if (total > items.length) truncated[name] = { returned: items.length, total };
     } else {
-      result[name] = await context.page
+      values[name] = await context.page
         .$eval(
           selector,
           (el, opts) => {
@@ -205,46 +223,72 @@ async function extractBySchema(context, schema) {
         .catch(() => null);
     }
   }
-  return result;
+  return { values, truncated };
 }
 
 /**
- * Select matching elements as records (text, html, attributes).
+ * Select matching elements as records (text, html, attributes), reporting the
+ * total match count so truncation is explicit (issue #61).
  * @param {import('crawlee').PlaywrightCrawlingContext} context
  * @param {string} selector
+ * @param {number} maxItems
+ * @returns {Promise<{ items: Array<{ text: string, html: string, attrs: Record<string, string> }>, total: number }>}
  */
-async function selectElements(context, selector) {
-  return context.page.$$eval(selector, (elements) =>
-    elements.slice(0, 5000).map((el) => {
-      const node = /** @type {HTMLElement} */ (el);
-      return {
-        text: (node.innerText ?? el.textContent ?? '').trim(),
-        html: el.outerHTML,
-        attrs: Object.fromEntries([...el.attributes].map((attribute) => [attribute.name, attribute.value])),
-      };
+async function selectElements(context, selector, maxItems) {
+  return context.page.$$eval(
+    selector,
+    (elements, limit) => ({
+      items: elements.slice(0, limit).map((el) => {
+        const node = /** @type {HTMLElement} */ (el);
+        return {
+          text: (node.innerText ?? el.textContent ?? '').trim(),
+          html: el.outerHTML,
+          attrs: Object.fromEntries([...el.attributes].map((attribute) => [attribute.name, attribute.value])),
+        };
+      }),
+      total: elements.length,
     }),
+    maxItems,
   );
+}
+
+/**
+ * Read the body text plus its untruncated length (issue #61).
+ * @param {import('crawlee').PlaywrightCrawlingContext} context
+ * @returns {Promise<{ text: string, total: number }>}
+ */
+async function getTextSnapshot(context) {
+  return context.page
+    .evaluate((limit) => {
+      const text = document.body ? document.body.innerText : '';
+      return { text: text.slice(0, limit), total: text.length };
+    }, MAX_TEXT_CHARS)
+    .catch(() => ({ text: '', total: 0 }));
 }
 
 /**
  * @param {import('crawlee').PlaywrightCrawlingContext} context
  */
 async function getTextContent(context) {
-  return context.page.evaluate(() => (document.body ? document.body.innerText.slice(0, 200000) : '')).catch(() => '');
+  const snapshot = await getTextSnapshot(context);
+  return snapshot.text;
 }
 
 /**
+ * Collect http(s) links plus the total count before capping (issue #61).
  * @param {import('crawlee').PlaywrightCrawlingContext} context
+ * @param {number} maxItems
+ * @returns {Promise<{ links: string[], total: number }>}
  */
-async function getLinks(context) {
+async function getLinks(context, maxItems) {
   return context.page
-    .evaluate(() =>
-      [...document.querySelectorAll('a[href]')]
+    .evaluate((limit) => {
+      const all = [...document.querySelectorAll('a[href]')]
         .map((anchor) => /** @type {HTMLAnchorElement} */ (anchor).href)
-        .filter((hrefText) => /^https?:\/\//i.test(hrefText))
-        .slice(0, 5000),
-    )
-    .catch(() => []);
+        .filter((hrefText) => /^https?:\/\//i.test(hrefText));
+      return { links: all.slice(0, limit), total: all.length };
+    }, maxItems)
+    .catch(() => ({ links: [], total: 0 }));
 }
 
 /**
@@ -492,11 +536,13 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
           blocked: true,
         });
       } else {
-        const text = await getTextContent(context);
+        const textSnapshot = await getTextSnapshot(context);
+        const text = textSnapshot.text;
         const failed = (status !== null && status >= 400) || !text.trim();
         if (((status !== null && status >= 500) || !text.trim()) && request.retryCount < plan.retries)
           throw new Error(status !== null && status >= 500 ? `HTTP ${status}; retrying` : 'Empty body; retrying');
         const html = await context.page.content().catch(() => '');
+        const linksSnapshot = await getLinks(context, plan.maxItems);
         const record = {
           type: 'result',
           failed,
@@ -506,7 +552,7 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
           depth,
           text,
           html,
-          links: await getLinks(context),
+          links: linksSnapshot.links,
           challenge,
           attempts: request.retryCount + 1,
           retried: request.retryCount > 0,
@@ -514,12 +560,31 @@ async function buildScrapeCrawler(plan, state, launchConfig, schema) {
           durationMs: Date.now() - startedAt,
           requestId: request.id,
         };
-        if (plan.select) record.selected = await selectElements(context, plan.select);
-        if (schema) record.extracted = await extractBySchema(context, schema);
+        // Report every cap that was hit so partial output is never mistaken for
+        // a complete extraction (issue #61).
+        const truncated = {};
+        if (textSnapshot.total > text.length)
+          truncated.text = { returned: text.length, total: textSnapshot.total };
+        if (linksSnapshot.total > linksSnapshot.links.length)
+          truncated.links = { returned: linksSnapshot.links.length, total: linksSnapshot.total };
+        if (plan.select) {
+          const selection = await selectElements(context, plan.select, plan.maxItems);
+          record.selected = selection.items;
+          if (selection.total > selection.items.length)
+            truncated.selected = { returned: selection.items.length, total: selection.total };
+        }
+        if (schema) {
+          const extraction = await extractBySchema(context, schema, plan.maxItems);
+          record.extracted = extraction.values;
+          for (const [field, info] of Object.entries(extraction.truncated)) truncated[field] = info;
+        }
+        if (Object.keys(truncated).length)
+          record.truncated = truncated;
         state.results.push(record);
       }
       if (!challenge.blocked && plan.crawl && depth < plan.maxDepth) {
-        const links = await getLinks(context);
+        const crawlLinks = await getLinks(context, plan.maxItems);
+        const links = crawlLinks.links;
         if (plan.sameOrigin) {
           // Origin boundary (scheme+host+port), stricter than hostname-only.
           await context.enqueueLinks({
@@ -568,7 +633,9 @@ function formatScrape(payload, format, crawl) {
     if (!columns.length) throw new Error('CSV output requires --select or --schema extraction.');
     const escape = (value) => {
       const text = Array.isArray(value) ? value.join(' ') : value == null ? '' : String(value);
-      return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+      // A bare carriage return must also force quoting, or a CSV reader splits
+      // one value into two records (issue #62).
+      return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
     };
     const lines = [columns.map(escape).join(',')];
     for (const row of rows) lines.push(columns.map((column) => escape(row[column])).join(','));

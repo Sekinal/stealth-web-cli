@@ -706,6 +706,7 @@ function prepareCommandArgs(args) {
     headers,
     body,
     binary,
+    json,
     attempts,
     retried: attempts > 1,
     durationMs: Date.now() - startedAt,
@@ -1058,16 +1059,25 @@ function parseHeaderLines(text) {
 
 /**
  * Parse a single `--header="Key: Value"` argument into an object. Multiple
- * comma-separated headers are supported.
+ * comma-separated headers are supported, but a comma inside a header value
+ * (Accept lists, HTTP dates, quoted strings) must be preserved: only a comma
+ * followed by a new `Name:` starts another header (issue #45).
  * @param {string} arg
  * @returns {Record<string, string>}
  */
 function parseHeaderArg(arg) {
   const headers = /** @type {Record<string, string>} */ ({});
+  const TOKEN = "[A-Za-z0-9!#$%&'*+.^_`|~-]+";
+  const startsHeader = new RegExp(`^\\s*(${TOKEN})\\s*:\\s*([\\s\\S]*)$`);
+  let currentName = null;
   for (const part of String(arg).split(',')) {
-    const kv = part.match(/^([^:]+):\s*(.*)$/);
-    if (kv)
-      headers[kv[1].trim()] = kv[2].trim();
+    const kv = part.match(startsHeader);
+    if (kv) {
+      currentName = kv[1].trim();
+      headers[currentName] = kv[2].trim();
+    } else if (currentName) {
+      headers[currentName] = `${headers[currentName]},${part}`;
+    }
   }
   return headers;
 }
