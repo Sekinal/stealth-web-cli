@@ -39,6 +39,8 @@ function bundledSkillFile() {
 /**
  * Copy this package's bundled skill (SKILL.md + references) into the requested
  * target, instead of letting upstream install playwright-core's copy (#64).
+ * Text files are written with LF endings so a platform checkout's CRLF cannot
+ * make the installed skill differ from the bundled source (#64).
  * @param {string | undefined} target 'agents' or undefined/anything else for claude
  */
 function installBundledSkill(target) {
@@ -46,9 +48,26 @@ function installBundledSkill(target) {
   const dir = target === 'agents'
     ? path.join(cwd, '.agents', 'skills', 'playwright-cli')
     : path.join(cwd, '.claude', 'skills', 'playwright-cli');
-  fs.mkdirSync(dir, { recursive: true });
-  fs.cpSync(bundledSkillDir(), dir, { recursive: true });
+  copySkillNormalized(bundledSkillDir(), dir);
   console.log(`Installed the stealth-web-cli skill to ${path.relative(cwd, dir) || dir}`);
+}
+
+/**
+ * @param {string} sourceDir
+ * @param {string} targetDir
+ */
+function copySkillNormalized(sourceDir, targetDir) {
+  fs.mkdirSync(targetDir, { recursive: true });
+  for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
+    const from = path.join(sourceDir, entry.name);
+    const to = path.join(targetDir, entry.name);
+    if (entry.isDirectory())
+      copySkillNormalized(from, to);
+    else if (/\.(md|txt|json|ya?ml)$/i.test(entry.name))
+      fs.writeFileSync(to, fs.readFileSync(from, 'utf8').replace(/\r\n/g, '\n'));
+    else
+      fs.copyFileSync(from, to);
+  }
 }
 
 function installedSkillTargets() {
