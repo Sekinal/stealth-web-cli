@@ -71,6 +71,7 @@ async function main() {
   }
   const providerConfig = await configureBrowserProvider({ command, sessionModule });
   configureCliEnhancements({ argv, command, providerConfig, sessionModule, outputModule, help });
+  require('./sessionLifecycle').configureSessionLifecycle(sessionModule);
   await notifyAboutUpdate(command).catch(() => {});
   await program({ embedderVersion: packageJson.version });
 }
