@@ -7,3 +7,6 @@
 !scraper.js
 !skillCheck.js
 !skills/**
+
+!sessionLifecycle.js
+!sessionLifecyclePreload.js
