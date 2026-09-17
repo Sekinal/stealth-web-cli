@@ -84,7 +84,10 @@ Never disable a failing test instead of fixing it.
   cleaned by the test harness, but a manually leaked daemon on
   `/tmp/pw-*/cli/*.sock` can make results confusing. `pkill -f cliDaemon`
   if in doubt.
-- `playwright-cli close` per session; `close --all` is NOT a supported flag.
+- `playwright-cli close` per session; `close-all` closes the current workspace.
+  `list --all` discovers sessions across workspaces; `close --all` is unsupported.
+- Owned daemons expire after 1800 idle seconds (`PLAYWRIGHT_CLI_IDLE_TIMEOUT=0`
+  disables expiry). The session count threshold warns; it never blocks opens.
 - The daemon reads `PLAYWRIGHT_MCP_CONFIG` from its inherited environment —
   the config tmp dir is removed when the CLI process exits.
 - Tests inherit the ambient env; anything provider-related must work when

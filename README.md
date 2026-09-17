@@ -671,3 +671,22 @@ The installed skill includes detailed reference guides for common tasks:
 * **Tracing** — record and inspect execution traces
 * **Video recording** — capture browser session videos
 * **Inspecting element attributes** — get element id, class, or any attribute not visible in the snapshot
+
+### Browser session lifetime
+
+CLI-launched browsers close after **30 minutes without a connected command**.
+Each completed command resets the idle timer; a running command is allowed to
+finish. Set `PLAYWRIGHT_CLI_IDLE_TIMEOUT` to a number of seconds to change this,
+or `0` to keep sessions open indefinitely. Persistent profiles retain their data
+when the browser expires. Attached browsers are excluded.
+
+Opening a browser warns on stderr when **8 or more managed sessions** are running
+across workspaces. This is a warning, not a cap: new sessions remain allowed.
+Set `PLAYWRIGHT_CLI_SESSION_WARNING_THRESHOLD` to change the threshold, or `0` to
+disable the warning. Use `list --all` to discover sessions, `-s=<name> close` to
+close one, and `close-all` to close the current workspace's sessions.
+
+On Unix, a managed daemon also shuts down if its CLI socket disappears. Stale
+lifecycle records are pruned when another browser is opened. These protections
+apply to daemons started by this version; close older sessions explicitly and
+reopen them to adopt the new lifetime policy.

@@ -462,3 +462,11 @@ playwright-cli show --annotate
 * **Tracing** [references/tracing.md](references/tracing.md)
 * **Video recording** [references/video-recording.md](references/video-recording.md)
 * **Inspecting element attributes** [references/element-attributes.md](references/element-attributes.md)
+
+## Session cleanup
+
+Close named sessions when finished: `playwright-cli -s=<name> close`. Use
+`list --all` to discover sessions across workspaces and `close-all` to close
+the current workspace. A session-count warning is a prompt to clean up unused
+browsers; it does not prevent opening another session. Owned browsers expire
+after 30 idle minutes by default, with active commands protected.

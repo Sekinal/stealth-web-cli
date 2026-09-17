@@ -1744,7 +1744,7 @@ test('published package includes the scrape runtime', async () => {
   });
   const packages: Record<string, { files: { path: string }[] }> = JSON.parse(output);
   expect(Object.values(packages)[0].files.map(file => file.path)).toEqual(expect.arrayContaining([
-    'playwright-cli.js', 'browserProviders.js', 'cliEnhancements.js', 'scraper.js',
+    'playwright-cli.js', 'browserProviders.js', 'cliEnhancements.js', 'scraper.js', 'sessionLifecycle.js', 'sessionLifecyclePreload.js',
   ]));
 });
 
@@ -2802,5 +2802,107 @@ test('console reports the CloakBrowser capture limitation instead of a false zer
   } finally {
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('session lifetime expires idle browsers and releases the session registry', async () => {
+  const options = { env: { PLAYWRIGHT_CLI_IDLE_TIMEOUT: '2' } };
+  const session = '-s=lifetime-idle';
+  const root = path.join(test.info().outputPath(), 'daemon');
+  const records = () => fs.existsSync(root) ? fs.readdirSync(root, { recursive: true }).map(String).filter(file => file.endsWith('lifetime-idle.session')) : [];
+  try {
+    const opened = await runCliWithOptions(options, session, 'open', 'data:text/html,<h1>Idle</h1>');
+    expect(opened.exitCode, opened.error).toBe(0);
+    expect(records()).toHaveLength(1);
+    const config = JSON.parse(fs.readFileSync(path.join(root, records()[0]), 'utf8'));
+    const processInfo = await runCliWithOptions(options, session, 'run-code', 'async page => { const cdp = await page.context().browser().newBrowserCDPSession(); const info = await cdp.send("SystemInfo.getProcessInfo"); await cdp.detach(); return info.processInfo.find(p => p.type === "browser").id; }', '--json');
+    expect(processInfo.exitCode, processInfo.output || processInfo.error).toBe(0);
+    const browserPid: number = JSON.parse(processInfo.output).result;
+    expect(browserPid).toBeGreaterThan(0);
+    await expect.poll(records, { timeout: 10000 }).toHaveLength(0);
+    if (process.platform !== 'win32') expect(fs.existsSync(config.socketPath)).toBe(false);
+    await expect.poll(() => {
+      try { process.kill(browserPid, 0); return true; } catch { return false; }
+    }, { timeout: 10000 }).toBe(false);
+    expect((await runCliWithOptions(options, session, 'eval', '1')).exitCode).toBe(1);
+  } finally {
+    await runCliWithOptions(options, session, 'close');
+  }
+});
+
+test('session lifetime warns without blocking opens across workspaces', async () => {
+  const firstDir = test.info().outputPath('first');
+  const secondDir = test.info().outputPath('second');
+  fs.mkdirSync(firstDir, { recursive: true });
+  fs.mkdirSync(secondDir, { recursive: true });
+  const env = { PLAYWRIGHT_CLI_SESSION_WARNING_THRESHOLD: '1', PLAYWRIGHT_CLI_IDLE_TIMEOUT: '0' };
+  try {
+    const results = await Promise.all([
+      runCliWithOptions({ env, cwd: firstDir }, '-s=lifetime-first', 'open', 'data:text/html,First'),
+      runCliWithOptions({ env, cwd: secondDir }, '-s=lifetime-second', 'open', 'data:text/html,Second'),
+    ]);
+    expect(results.map(result => result.exitCode).sort()).toEqual([0, 0]);
+    expect(results.map(result => result.error).join('\n')).toContain('browser sessions');
+    expect(results.map(result => result.error).join('\n')).toContain('close-all');
+  } finally {
+    await runCliWithOptions({ env, cwd: firstDir }, '-s=lifetime-first', 'close');
+    await runCliWithOptions({ env, cwd: secondDir }, '-s=lifetime-second', 'close');
+  }
+});
+
+test('session lifetime preserves active commands and expires after the last command', async () => {
+  const options = { env: { PLAYWRIGHT_CLI_IDLE_TIMEOUT: '1' } };
+  const session = '-s=lifetime-active';
+  try {
+    expect((await runCliWithOptions(options, session, 'open', 'data:text/html,Active')).exitCode).toBe(0);
+    const result = await runCliWithOptions(options, session, 'run-code', 'async page => { await page.waitForTimeout(2500); return "completed"; }');
+    expect(result.exitCode, result.output || result.error).toBe(0);
+    expect(result.output).toContain('completed');
+    expect((await runCliWithOptions(options, session, 'eval', '42')).exitCode).toBe(0);
+    const root = path.join(test.info().outputPath(), 'daemon');
+    await expect.poll(() => fs.readdirSync(root, { recursive: true }).map(String).filter(file => file.endsWith('lifetime-active.session')), { timeout: 10000 }).toHaveLength(0);
+  } finally {
+    await runCliWithOptions(options, session, 'close');
+  }
+});
+
+test('session lifetime supports disabled expiry and reaps a missing daemon socket', async () => {
+  const options = { env: { PLAYWRIGHT_CLI_IDLE_TIMEOUT: '0' } };
+  const session = '-s=lifetime-orphan';
+  const root = path.join(test.info().outputPath(), 'daemon');
+  try {
+    expect((await runCliWithOptions(options, session, 'open', 'data:text/html,Orphan')).exitCode).toBe(0);
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    expect((await runCliWithOptions(options, session, 'eval', '42')).exitCode).toBe(0);
+    if (process.platform !== 'win32') {
+      const file = fs.readdirSync(root, { recursive: true }).map(String).find(file => file.endsWith('lifetime-orphan.session'))!;
+      const config = JSON.parse(fs.readFileSync(path.join(root, file), 'utf8'));
+      fs.unlinkSync(config.socketPath);
+      await expect.poll(() => fs.existsSync(path.join(root, file)), { timeout: 10000 }).toBe(false);
+    }
+  } finally {
+    await runCliWithOptions(options, session, 'close');
+  }
+});
+
+test('session lifetime does not expire an explicitly attached browser', async () => {
+  const { chromium } = require('playwright');
+  const cloakbrowser = await import('cloakbrowser');
+  const browserServer = await chromium.launchServer(await cloakbrowser.buildLaunchOptions({ headless: true }));
+  const session = '-s=lifetime-attached';
+  const options = { env: { PLAYWRIGHT_CLI_IDLE_TIMEOUT: '0.5' } };
+  try {
+    const configPath = test.info().outputPath('attached.json');
+    fs.writeFileSync(configPath, JSON.stringify({ browser: { isolated: true } }));
+    const opened = await runCliWithOptions(options, session, 'attach', `--endpoint=${browserServer.wsEndpoint()}`, `--config=${configPath}`);
+    expect(opened.exitCode, opened.output || opened.error).toBe(0);
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    expect((await runCliWithOptions(options, session, 'eval', '42')).exitCode).toBe(0);
+    expect(browserServer.process().exitCode).toBeNull();
+    expect((await runCliWithOptions(options, session, 'close')).exitCode).toBe(0);
+    expect(browserServer.process().exitCode).toBeNull();
+  } finally {
+    await runCliWithOptions(options, session, 'close');
+    await browserServer.close();
   }
 });
