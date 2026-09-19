@@ -218,38 +218,38 @@ async function extractBySchema(context, schema, maxItems) {
     const { selector, attr, all } = extractor;
     const attrName = attr ?? null;
     try {
-    if (all) {
-      const { items, total } = await context.page.$$eval(
-        selector,
-        (elements, opts) => ({
-          items: elements.slice(0, opts.limit).map((el) => {
-            if (opts.attr) return el.getAttribute(opts.attr);
-            const node = /** @type {HTMLElement} */ (el);
-            return (node.innerText ?? el.textContent ?? '').trim();
+      if (all) {
+        const { items, total } = await context.page.$$eval(
+          selector,
+          (elements, opts) => ({
+            items: elements.slice(0, opts.limit).map((el) => {
+              if (opts.attr) return el.getAttribute(opts.attr);
+              const node = /** @type {HTMLElement} */ (el);
+              return (node.innerText ?? el.textContent ?? '').trim();
+            }),
+            total: elements.length,
           }),
-          total: elements.length,
-        }),
-        { attr: attrName, limit: maxItems },
-      );
-      values[name] = items;
-      if (total > items.length) truncated[name] = { returned: items.length, total };
-    } else {
-      // Distinguish "no matching element" (null) from an invalid selector:
-      // $$eval throws on malformed CSS, while an empty match set yields null
-      // (issue #43). The previous $eval().catch() masked both as null.
-      const { found, value } = await context.page.$$eval(
-        selector,
-        (elements, opts) => {
-          const el = elements[0];
-          if (!el) return { found: false, value: null };
-          if (opts.attr) return { found: true, value: el.getAttribute(opts.attr) };
-          const node = /** @type {HTMLElement} */ (el);
-          return { found: true, value: (node.innerText ?? el.textContent ?? '').trim() };
-        },
-        { attr: attrName },
-      );
-      values[name] = found ? value : null;
-    }
+          { attr: attrName, limit: maxItems },
+        );
+        values[name] = items;
+        if (total > items.length) truncated[name] = { returned: items.length, total };
+      } else {
+        // Distinguish "no matching element" (null) from an invalid selector:
+        // $$eval throws on malformed CSS, while an empty match set yields null
+        // (issue #43). The previous $eval().catch() masked both as null.
+        const { found, value } = await context.page.$$eval(
+          selector,
+          (elements, opts) => {
+            const el = elements[0];
+            if (!el) return { found: false, value: null };
+            if (opts.attr) return { found: true, value: el.getAttribute(opts.attr) };
+            const node = /** @type {HTMLElement} */ (el);
+            return { found: true, value: (node.innerText ?? el.textContent ?? '').trim() };
+          },
+          { attr: attrName },
+        );
+        values[name] = found ? value : null;
+      }
     } catch (error) {
       throw new Error(`schema field '${name}' (selector ${JSON.stringify(selector)}): ${error instanceof Error ? error.message : String(error)}`);
     }

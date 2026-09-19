@@ -62,8 +62,12 @@ function installSecretRedaction() {
   for (const stream of [process.stdout, process.stderr]) {
     const original = stream.write.bind(stream);
     stream.write = function(/** @type {any} */ chunk, /** @type {any[]} */ ...rest) {
-      if (typeof chunk === 'string' && redactionSecrets.size)
-        chunk = redactSecrets(chunk);
+      if (redactionSecrets.size) {
+        if (typeof chunk === 'string')
+          chunk = redactSecrets(chunk);
+        else if (Buffer.isBuffer(chunk))
+          chunk = redactSecrets(chunk.toString('utf8'));
+      }
       return original(chunk, ...rest);
     };
   }

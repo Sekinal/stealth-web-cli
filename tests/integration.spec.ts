@@ -1951,7 +1951,7 @@ test('HTTP engines route through the configured proxy (issue 44)', async () => {
       // proxy. httpcloak tunnels via CONNECT, so a plain fixture yields a
       // proxy-dial error that still proves routing (and never a direct hit).
       expect(hits, `${engine}: ${result.output}`).not.toContain('target');
-      const routed = hits.includes('proxy') || /dial_proxy|proxy/i.test(result.output);
+      const routed = hits.includes('proxy') || /dial_proxy/i.test(result.output);
       expect(routed, `${engine}: ${result.output}`).toBe(true);
       if (hits.includes('proxy'))
         expect(JSON.parse(result.output).result.json.source).toBe('proxy');
